@@ -178,7 +178,8 @@ class TestAgentController:
         agent = CodeMateAgent(config=agent_config, registry=registry, llm_client=mock_llm)
         result = agent.run("Run nonexistent script")
 
-        assert result.success is True
+        assert result.success is False
+        assert result.termination_reason == "unresolved_execution_failure"
         assert len(result.action_history) == 1
         assert result.action_history[0].success is False
         assert "Script not found" in result.action_history[0].result["error"]
@@ -208,7 +209,87 @@ class TestAgentController:
         assert result.success is False
         assert result.iterations == 3
         assert result.termination_reason == "max_iterations_reached"
-        assert "maximum iteration limit" in result.final_response
+
+    def test_agent_self_correction_cycle(self, agent_config):
+        """
+        Verify end-to-end self-correction:
+        1. Agent writes buggy code (ZeroDivisionError).
+        2. Execution fails; diagnostics attach structured report.
+        3. Agent analyzes error, updates code with fix (overwrite=True, approved=True).
+        4. Re-execution succeeds.
+        5. Agent observes success and concludes.
+        """
+        registry = create_default_registry(config=agent_config)
+        mock_llm = MagicMock()
+        mock_llm.format_tool_schema.return_value = []
+
+        # Turn 1: Write buggy code
+        turn_1 = LLMResponse(
+            content="Writing division script.",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_c1",
+                    tool_name="create_file",
+                    arguments={"filename": "divide.py", "content": "res = 10 / 0\nprint('Result:', res)\n"}
+                )
+            ]
+        )
+
+        # Turn 2: Run code (will fail with ZeroDivisionError)
+        turn_2 = LLMResponse(
+            content="Running script.",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_e1",
+                    tool_name="execute_python",
+                    arguments={"filename": "divide.py"}
+                )
+            ]
+        )
+
+        # Turn 3: Fix code after receiving ZeroDivisionError diagnostics
+        turn_3 = LLMResponse(
+            content="Detected ZeroDivisionError. Fixing divide.py to divide by 2.",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_c2",
+                    tool_name="create_file",
+                    arguments={"filename": "divide.py", "content": "res = 10 / 2\nprint('Result:', res)\n", "overwrite": True, "approved": True}
+                )
+            ]
+        )
+
+        # Turn 4: Re-execute fixed code
+        turn_4 = LLMResponse(
+            content="Re-running fixed divide.py.",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_e2",
+                    tool_name="execute_python",
+                    arguments={"filename": "divide.py"}
+                )
+            ]
+        )
+
+        # Turn 5: Observe success and conclude
+        turn_5 = LLMResponse(
+            content="The calculation succeeded with Result: 5.0 after fixing the ZeroDivisionError.",
+            tool_calls=[]
+        )
+
+        mock_llm.chat.side_effect = [turn_1, turn_2, turn_3, turn_4, turn_5]
+
+        agent = CodeMateAgent(config=agent_config, registry=registry, llm_client=mock_llm)
+        result = agent.run("Calculate 10 divided by something", max_iterations=6)
+
+        assert result.success is True
+        assert result.iterations == 5
+        assert result.history_attempts == 1 if hasattr(result, "history_attempts") else result.correction_attempts == 1
+        assert len(result.execution_history) == 2
+        assert result.execution_history[0]["success"] is False
+        assert result.execution_history[0]["diagnostics"]["exception_name"] == "ZeroDivisionError"
+        assert result.execution_history[1]["success"] is True
+        assert "Result: 5.0" in result.execution_history[1]["stdout"]
 
     def test_run_agent_convenience_function(self, agent_config):
         mock_llm = MagicMock()

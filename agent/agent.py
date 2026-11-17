@@ -5,17 +5,16 @@ CodeMate AI - Core Autonomous Agent Controller (agent/agent.py)
 Implements the ReAct (Reason + Act + Observe) autonomous execution loop.
 Directly communicates with the Groq API using standard function/tool-calling schemas,
 dispatches tool executions through the Python tool registry, captures runtime feedback,
-and autonomously attempts self-correction until the task is complete.
+analyzes tracebacks with the diagnostics engine, and autonomously attempts error self-correction.
 
-Key Architecture:
-- Step 1: User submits a natural language programming task.
-- Step 2: System instructions, tool schemas, and history are passed to Groq.
-- Step 3: LLM emits one or more tool calls (e.g., create_file, execute_python).
-- Step 4: Agent executes the tool via ToolRegistry in workspace/.
-- Step 5: Real tool execution output (stdout, stderr, exit code) is captured.
-- Step 6: Tool result is fed back into conversation history as a 'tool' role message.
-- Step 7: LLM inspects result. If errors exist, it formulates a fix and updates the file.
-- Step 8: Loop terminates on success, max iterations limit, or human rejection.
+Self-Correction Workflow:
+1. Generate & save code to workspace/
+2. Execute in restricted subprocess sandbox
+3. Capture stdout, stderr, and exit_code
+4. If failed, analyze via diagnostics engine (SyntaxError vs RuntimeError vs Timeout vs AssertionError)
+5. Feed structured diagnostic feedback into conversation history
+6. Model inspects diagnostics, patches file (approved=True, overwrite=True)
+7. Re-execute and observe until verified success or max retries
 """
 
 import json
@@ -26,6 +25,7 @@ from typing import Any, Dict, List, Optional
 from config import Config, load_config
 from agent.prompts import SYSTEM_PROMPT
 from agent.llm_client import GroqClient, LLMResponse, ToolCallRequest
+from agent.diagnostics import parse_execution_error, DiagnosticReport
 from tools.tool_registry import ToolRegistry, create_default_registry
 
 # Configure module-level logger
@@ -81,17 +81,19 @@ class AgentResult:
     iterations: int
     max_iterations: int
     termination_reason: str
+    correction_attempts: int = 0
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_tokens: int = 0
+    execution_history: List[Dict[str, Any]] = field(default_factory=list)
     action_history: List[ToolExecutionRecord] = field(default_factory=list)
     messages: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class CodeMateAgent:
     """
-    Autonomous Coding Agent Controller implementing the ReAct loop.
-    Supports both autonomous run() execution and interactive execute_step() stepping.
+    Autonomous Coding Agent Controller implementing the ReAct loop
+    with automated error detection, diagnosis, and self-correction.
     """
 
     def __init__(
@@ -156,10 +158,14 @@ class CodeMateAgent:
             "status": "ready_for_llm_dispatch"
         }
 
-    def _execute_tool_call(self, tool_call: ToolCallRequest, iteration: int) -> ToolExecutionRecord:
+    def _execute_tool_call(
+        self,
+        tool_call: ToolCallRequest,
+        iteration: int
+    ) -> ToolExecutionRecord:
         """
-        Dispatch a single tool call through the registry and return a telemetry record.
-        Never pretends a tool succeeded when it failed.
+        Dispatch a single tool call through the registry.
+        Applies diagnostics on execution failures and maintains error state.
         """
         args = dict(tool_call.arguments)
 
@@ -176,11 +182,28 @@ class CodeMateAgent:
             args
         )
 
-        # Execute through Python tool registry (Real execution inside workspace/)
+        # Execute through Python tool registry
         result = self.registry.dispatch(tool_call.tool_name, **args)
         is_success = bool(result.get("success", False))
 
-        if is_success:
+        # Perform error diagnostics for Python code execution failures
+        if tool_call.tool_name == "execute_python" and not is_success:
+            report: DiagnosticReport = parse_execution_error(
+                stdout=result.get("stdout", ""),
+                stderr=result.get("stderr", ""),
+                exit_code=result.get("exit_code"),
+                timed_out=result.get("timed_out", False)
+            )
+            result["diagnostics"] = report.to_dict()
+            logger.warning(
+                "[Iter %d] Execution failure diagnosed: Category='%s', Type='%s', Line=%s: %s",
+                iteration,
+                report.category,
+                report.exception_name,
+                report.failed_line,
+                report.actionable_suggestion
+            )
+        elif is_success:
             logger.info("[Iter %d] Tool '%s' executed successfully.", iteration, tool_call.tool_name)
         else:
             logger.warning(
@@ -201,14 +224,14 @@ class CodeMateAgent:
 
     def run(self, task: str, max_iterations: Optional[int] = None) -> AgentResult:
         """
-        Run the autonomous agent loop for a user task.
+        Run the autonomous agent loop with error diagnosis and self-correction.
 
         Args:
             task: Natural language programming instruction.
             max_iterations: Maximum ReAct cycles (defaults to config.max_iterations).
 
         Returns:
-            AgentResult: Execution report with final answer and action history.
+            AgentResult: Execution report with verified answer, attempts, and history.
         """
         limit = max_iterations if max_iterations is not None else self.config.max_iterations
         if limit <= 0:
@@ -222,6 +245,8 @@ class CodeMateAgent:
             self.state.max_iterations = limit
 
         action_history: List[ToolExecutionRecord] = []
+        execution_history: List[Dict[str, Any]] = []
+        correction_attempts = 0
         total_prompt_tokens = 0
         total_completion_tokens = 0
         total_tokens = 0
@@ -285,6 +310,20 @@ class CodeMateAgent:
                     if self.state:
                         self.state.log_action(tool_call.tool_name, record.result)
 
+                    # Maintain execution-specific history and correction counter
+                    if tool_call.tool_name == "execute_python":
+                        execution_history.append({
+                            "iteration": current_iteration,
+                            "filename": record.arguments.get("filename"),
+                            "success": record.success,
+                            "exit_code": record.result.get("exit_code"),
+                            "stdout": record.result.get("stdout"),
+                            "stderr": record.result.get("stderr"),
+                            "diagnostics": record.result.get("diagnostics")
+                        })
+                        if not record.success:
+                            correction_attempts += 1
+
                     # Provide tool output back to LLM context
                     tool_response_msg: Dict[str, Any] = {
                         "role": "tool",
@@ -307,27 +346,36 @@ class CodeMateAgent:
                     "content": final_response_text
                 })
 
-                termination_reason = "completed"
-                success = True
+                # Verify if any executions occurred and whether the last execution passed
+                if execution_history:
+                    last_exec = execution_history[-1]
+                    success = bool(last_exec.get("success", False))
+                    termination_reason = "completed" if success else "unresolved_execution_failure"
+                else:
+                    success = True
+                    termination_reason = "completed"
+
                 if self.state:
                     self.state.completed = True
-                    self.state.success = True
+                    self.state.success = success
                 break
 
-        if not success:
+        if not success and termination_reason == "max_iterations_reached":
             logger.warning(
                 "Agent stopped: Reached limit of %d iterations without full completion.",
                 limit
             )
             final_response_text = (
                 f"Agent reached the maximum iteration limit ({limit}) without concluding. "
+                f"Correction attempts made: {correction_attempts}. "
                 "Review the action history and tool execution logs for partial progress."
             )
 
         logger.info(
-            "Task finished. Reason: %s. Iterations: %d. Total tokens: %d",
+            "Task finished. Reason: %s. Iterations: %d. Correction Attempts: %d. Total tokens: %d",
             termination_reason,
             current_iteration,
+            correction_attempts,
             total_tokens
         )
 
@@ -338,9 +386,11 @@ class CodeMateAgent:
             iterations=current_iteration,
             max_iterations=limit,
             termination_reason=termination_reason,
+            correction_attempts=correction_attempts,
             total_prompt_tokens=total_prompt_tokens,
             total_completion_tokens=total_completion_tokens,
             total_tokens=total_tokens,
+            execution_history=execution_history,
             action_history=action_history,
             messages=self.messages
         )
@@ -356,17 +406,6 @@ def run_agent(
 ) -> AgentResult:
     """
     Convenience function to initialize and run the CodeMate AI agent.
-
-    Args:
-        task: Natural language programming task.
-        config: Application configuration.
-        registry: Tool registry.
-        llm_client: Groq client.
-        max_iterations: Maximum iteration cycles.
-        auto_approve: Auto-approval for sandbox operations.
-
-    Returns:
-        AgentResult: Full execution report.
     """
     agent = CodeMateAgent(
         config=config,
