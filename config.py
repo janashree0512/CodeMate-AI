@@ -1,0 +1,184 @@
+"""
+CodeMate AI - Configuration Module
+==================================
+
+This module provides centralized, validated configuration for the application.
+It loads variables from the environment and '.env' file, validates limits and paths,
+and ensures that the workspace directory is properly created and isolated.
+
+Design Principles:
+- Single Source of Truth: All modules import runtime settings from this module.
+- Fail Fast: Invalid types or non-positive bounds raise explicit ConfigurationError.
+- Safe Defaults: Sensible limits protect against infinite loops and process hangs.
+"""
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+from dotenv import load_dotenv
+
+
+class ConfigurationError(Exception):
+    """Raised when environment variables or application settings are invalid."""
+    pass
+
+
+# Base project root directory (absolute path to CodeMate_AI)
+PROJECT_ROOT: Path = Path(__file__).resolve().parent
+
+
+def parse_bool(value: Optional[str], default: bool = True) -> bool:
+    """
+    Safely parse common string representations of booleans.
+    
+    Accepts: 'true', '1', 'yes', 't' -> True
+             'false', '0', 'no', 'f' -> False
+    """
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "t"}:
+        return True
+    if normalized in {"false", "0", "no", "f"}:
+        return False
+    raise ConfigurationError(
+        f"Invalid boolean value '{value}'. Expected 'true', 'false', '1', or '0'."
+    )
+
+
+def parse_positive_int(var_name: str, value: Optional[str], default: int) -> int:
+    """
+    Safely parse an integer environment variable, ensuring it is strictly positive (> 0).
+    """
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = int(value.strip())
+        if parsed <= 0:
+            raise ConfigurationError(
+                f"Configuration setting '{var_name}' must be a positive integer (> 0). Received: {parsed}"
+            )
+        return parsed
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"Configuration setting '{var_name}' must be a valid integer. Received: '{value}'"
+        ) from exc
+
+
+@dataclass(frozen=True)
+class Config:
+    """
+    Immutable application configuration container.
+    """
+    # LLM Settings
+    groq_api_key: str
+    model_name: str
+
+    # Agent Loop Boundaries
+    max_iterations: int
+    execution_timeout_seconds: int
+
+    # Safety Controls
+    require_user_approval: bool
+
+    # Sandboxed Workspace Path
+    workspace_dir: Path
+
+    # Root Path
+    project_root: Path
+
+    def ensure_workspace(self) -> Path:
+        """
+        Guarantees that the sandboxed workspace directory exists on disk.
+        Returns the absolute Path.
+        """
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        return self.workspace_dir
+
+    def validate_api_key(self) -> None:
+        """
+        Checks that a valid Groq API key is present.
+        Raises ConfigurationError if the key is missing or is the placeholder value.
+        """
+        if not self.groq_api_key or self.groq_api_key == "your_groq_api_key_here":
+            raise ConfigurationError(
+                "Missing GROQ_API_KEY. Please provide a valid Groq API key in your .env file "
+                "or set the GROQ_API_KEY environment variable. "
+                "Get a free API key at: https://console.groq.com/keys"
+            )
+
+
+def load_config(env_file: Optional[Path | str] = None, strict_api_key: bool = False) -> Config:
+    """
+    Load, parse, and validate configuration settings.
+
+    Parameters:
+    - env_file: Optional path to an alternate '.env' file.
+    - strict_api_key: If True, immediately validates that GROQ_API_KEY is populated.
+                      If False, allows loading without an API key (useful for offline unit testing).
+
+    Returns:
+    - Config: A frozen, validated configuration instance.
+    """
+    # 1. Load environment variables from .env if present
+    if env_file:
+        load_dotenv(dotenv_path=env_file, override=True)
+    else:
+        # Default behavior: search for .env in project root
+        default_env = PROJECT_ROOT / ".env"
+        if default_env.exists():
+            load_dotenv(dotenv_path=default_env)
+
+    # 2. Parse and validate LLM settings
+    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+    model_name = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile").strip()
+    if not model_name:
+        model_name = "llama-3.3-70b-versatile"
+
+    # 3. Parse and validate numerical execution boundaries
+    max_iterations = parse_positive_int(
+        "MAX_ITERATIONS",
+        os.getenv("MAX_ITERATIONS"),
+        default=10
+    )
+
+    execution_timeout_seconds = parse_positive_int(
+        "EXECUTION_TIMEOUT_SECONDS",
+        os.getenv("EXECUTION_TIMEOUT_SECONDS"),
+        default=10
+    )
+
+    # 4. Parse safety switches
+    require_user_approval = parse_bool(
+        os.getenv("REQUIRE_USER_APPROVAL"),
+        default=True
+    )
+
+    # 5. Resolve workspace directory path
+    raw_workspace = os.getenv("WORKSPACE_DIR", "workspace").strip()
+    workspace_path = Path(raw_workspace)
+    if not workspace_path.is_absolute():
+        workspace_path = (PROJECT_ROOT / workspace_path).resolve()
+    else:
+        workspace_path = workspace_path.resolve()
+
+    # 6. Instantiate configuration object
+    config = Config(
+        groq_api_key=groq_api_key,
+        model_name=model_name,
+        max_iterations=max_iterations,
+        execution_timeout_seconds=execution_timeout_seconds,
+        require_user_approval=require_user_approval,
+        workspace_dir=workspace_path,
+        project_root=PROJECT_ROOT
+    )
+
+    # 7. Auto-create workspace folder on configuration load
+    config.ensure_workspace()
+
+    # 8. Strict validation check if requested
+    if strict_api_key:
+        config.validate_api_key()
+
+    return config
