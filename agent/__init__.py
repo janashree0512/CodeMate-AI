@@ -13,6 +13,7 @@ from agent.llm_client import (
     LLMRateLimitError,
     LLMConnectionError,
 )
+from agent.agent import CodeMateAgent, run_agent, AgentResult, ToolExecutionRecord
 
 __all__ = [
     "SYSTEM_PROMPT",
@@ -25,4 +26,8 @@ __all__ = [
     "LLMAuthenticationError",
     "LLMRateLimitError",
     "LLMConnectionError",
+    "CodeMateAgent",
+    "run_agent",
+    "AgentResult",
+    "ToolExecutionRecord",
 ]
