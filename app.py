@@ -1,80 +1,308 @@
 """
-CodeMate AI - Streamlit User Interface (app.py)
-==============================================
+CodeMate AI - Professional Developer Dashboard (app.py)
+======================================================
 
-Frontend dashboard for CodeMate AI.
-Displays task input, real-time action summaries, tool execution logs,
-workspace file previews, and human-in-the-loop approval dialogs.
-
-Note:
-Internal model chain-of-thought is kept private; only action plans,
-tool calls, execution outputs, and user summaries are displayed.
+Modern Streamlit interface for CodeMate AI.
+Features real-time ReAct loop monitoring, workspace file inspection,
+terminal output capture, error diagnostics, and Human-in-the-Loop execution gates.
 """
 
+import sys
 import streamlit as st
-from config import load_config
+from pathlib import Path
+from typing import Any, Dict, Optional
+from unittest.mock import MagicMock
+
+from config import Config, load_config
+from agent.agent import CodeMateAgent, AgentResult, run_agent
+from agent.llm_client import GroqClient, LLMResponse, ToolCallRequest, LLMAuthenticationError, LLMClientError
 from tools.tool_registry import create_default_registry
+from ui import (
+    apply_custom_styles,
+    render_sidebar,
+    render_status_badge,
+    render_welcome_screen,
+    render_metrics,
+    render_terminal_output,
+    render_diagnostics,
+    render_tool_timeline,
+    render_code_viewer,
+    render_approval_card,
+)
 
 
-def render_ui():
-    """Render the primary Streamlit interface."""
+def init_session_state(config: Config):
+    """Initialize persistent Streamlit session state."""
+    if "tasks_history" not in st.session_state:
+        st.session_state["tasks_history"] = []
+    if "current_result" not in st.session_state:
+        st.session_state["current_result"] = None
+    if "task_input" not in st.session_state:
+        st.session_state["task_input"] = ""
+    if "agent_status" not in st.session_state:
+        st.session_state["agent_status"] = "idle"
+    if "pending_approval" not in st.session_state:
+        st.session_state["pending_approval"] = None
+    if "selected_example" not in st.session_state:
+        st.session_state["selected_example"] = None
+
+
+def run_agent_workflow(
+    task: str,
+    config: Config,
+    runtime_settings: Dict[str, Any],
+    use_mock: bool = False
+):
+    """
+    Execute the agent ReAct loop with progress indication and error boundaries.
+    """
+    st.session_state.agent_status = "running"
+
+    # Merge runtime settings with base configuration
+    effective_config = Config(
+        groq_api_key=config.groq_api_key,
+        model_name=runtime_settings.get("model_name", config.model_name),
+        max_iterations=runtime_settings.get("max_iterations", config.max_iterations),
+        execution_timeout_seconds=runtime_settings.get("timeout", config.execution_timeout_seconds),
+        require_user_approval=runtime_settings.get("require_approval", config.require_user_approval),
+        workspace_dir=config.workspace_dir,
+        project_root=config.project_root
+    )
+
+    registry = create_default_registry(config=effective_config)
+
+    # Handle mock / offline demonstration mode
+    if use_mock:
+        mock_llm = MagicMock()
+        mock_llm.format_tool_schema.return_value = [{"type": "function"}]
+
+        resp_1 = LLMResponse(
+            content="I will generate a Python script to address your task.",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_mock_1",
+                    tool_name="create_file",
+                    arguments={
+                        "filename": "generated_solution.py",
+                        "content": (
+                            "def solve():\n"
+                            "    items = [x**2 for x in range(1, 6)]\n"
+                            "    print('Computed squares:', items)\n"
+                            "    assert items == [1, 4, 9, 16, 25]\n"
+                            "    return items\n\n"
+                            "if __name__ == '__main__':\n"
+                            "    solve()\n"
+                        )
+                    }
+                )
+            ]
+        )
+        resp_2 = LLMResponse(
+            content="Script created. Now executing to verify assertions in the sandbox.",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_mock_2",
+                    tool_name="execute_python",
+                    arguments={"filename": "generated_solution.py"}
+                )
+            ]
+        )
+        resp_3 = LLMResponse(
+            content=(
+                "The script 'generated_solution.py' was created and executed in the workspace sandbox.\n"
+                "Execution Output: Computed squares: [1, 4, 9, 16, 25]\n"
+                "All assertions passed successfully."
+            ),
+            tool_calls=[]
+        )
+        mock_llm.chat.side_effect = [resp_1, resp_2, resp_3]
+        agent = CodeMateAgent(
+            config=effective_config,
+            registry=registry,
+            llm_client=mock_llm,
+            auto_approve=not effective_config.require_user_approval
+        )
+    else:
+        # Live execution with Groq API
+        agent = CodeMateAgent(
+            config=effective_config,
+            registry=registry,
+            auto_approve=not effective_config.require_user_approval
+        )
+
+    try:
+        with st.spinner("Agent is planning, generating code, and verifying in the sandbox..."):
+            result: AgentResult = agent.run(task=task)
+
+        st.session_state.current_result = result
+        st.session_state.agent_status = "completed" if result.success else "failed"
+
+        # Record into task history
+        st.session_state.tasks_history.append({
+            "task": task,
+            "success": result.success,
+            "iterations": result.iterations,
+            "result": result
+        })
+
+    except LLMAuthenticationError as err:
+        st.session_state.agent_status = "failed"
+        st.error(f"**Groq Authentication Error**: {err}")
+        st.info("Set your valid `GROQ_API_KEY` in `.env` or run in **Demonstration Mode** below.")
+
+    except Exception as err:
+        st.session_state.agent_status = "failed"
+        st.error(f"**Agent Error**: {err}")
+
+
+def main():
     st.set_page_config(
         page_title="CodeMate AI - Autonomous Coding Agent",
         page_icon="🤖",
-        layout="wide"
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
 
-    st.title("🤖 CodeMate AI")
-    st.caption("Autonomous AI-Powered Coding Agent (ReAct Loop & Self-Healing Sandbox)")
+    # Apply Developer Theme CSS
+    apply_custom_styles()
 
     # Load configuration
-    config = load_config(strict_api_key=False)
+    base_config = load_config(strict_api_key=False)
+    init_session_state(base_config)
 
-    # Sidebar: System configuration and parameters
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        st.info(f"**Model:** {config.model_name}")
-        st.write(f"**Max Iterations:** {config.max_iterations}")
-        st.write(f"**Execution Timeout:** {config.execution_timeout_seconds}s")
-        st.write(f"**User Approval:** {'Enabled' if config.require_user_approval else 'Disabled'}")
-        st.write(f"**Workspace:** `{config.workspace_dir.name}/`")
+    # Callbacks for sidebar
+    def handle_new_task():
+        st.session_state.current_result = None
+        st.session_state.task_input = ""
+        st.session_state.agent_status = "idle"
+        st.session_state.pending_approval = None
+        st.session_state.selected_example = None
+        st.rerun()
 
-        st.divider()
-        st.subheader("🛠️ Available Tools")
-        registry = create_default_registry(config=config)
-        for tool in registry.list_tools():
-            st.markdown(f"- **`{tool['name']}`**: {tool['description'][:60]}...")
+    def handle_select_history(index: int):
+        selected_record = st.session_state.tasks_history[index]
+        st.session_state.current_result = selected_record["result"]
+        st.session_state.task_input = selected_record["task"]
+        st.session_state.agent_status = "completed" if selected_record["success"] else "failed"
+        st.rerun()
 
-    # Main column layout
-    col1, col2 = st.columns([3, 2])
+    # Render Sidebar
+    runtime_settings = render_sidebar(
+        config=base_config,
+        history=st.session_state.tasks_history,
+        workspace_dir=base_config.workspace_dir,
+        on_new_task=handle_new_task,
+        on_select_history=handle_select_history
+    )
 
-    with col1:
-        st.subheader("💬 Task Instruction")
-        user_input = st.text_area(
-            "Enter a programming task:",
-            placeholder="e.g., Create a script that generates prime numbers up to 100, save it, and verify the output."
-        )
-        if st.button("🚀 Start Agent", type="primary"):
-            if not user_input.strip():
-                st.warning("Please provide a task description.")
-            else:
-                st.success(f"Task submitted: {user_input[:50]}...")
-                st.info("Agent controller loop will run here upon full activation.")
+    # Main Dashboard Header
+    title_col, badge_col = st.columns([3, 1])
+    with title_col:
+        st.markdown("## 🤖 CodeMate AI")
+        st.caption("Autonomous Software Engineering Agent | Closed-Loop ReAct Engine")
+    with badge_col:
+        st.markdown("<div style='text-align: right; margin-top: 10px;'>", unsafe_allow_html=True)
+        render_status_badge(st.session_state.agent_status)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    with col2:
-        st.subheader("📁 Workspace Files")
-        st.caption("Live files residing in the sandboxed workspace.")
-        files_result = registry.dispatch("list_files")
-        if files_result.get("success"):
-            entries = files_result.get("entries", [])
-            if not entries:
-                st.text("Workspace is currently empty.")
-            else:
-                for entry in entries:
-                    st.text(f"• {entry['path']} ({entry['size_bytes']} bytes)")
+    # Task Input Area
+    def on_example_click(text: str):
+        st.session_state.task_input = text
+        st.rerun()
+
+    current_val = st.session_state.task_input
+    user_prompt = st.text_area(
+        "Programming Task Instruction",
+        value=current_val,
+        placeholder="Describe the programming problem to solve, including target files, logic, and test verifications...",
+        height=95
+    )
+
+    # Action Buttons Row
+    btn_col1, btn_col2, btn_col3, _ = st.columns([1.2, 1.8, 1.2, 4])
+    has_key = bool(base_config.groq_api_key and base_config.groq_api_key != "your_groq_api_key_here")
+
+    with btn_col1:
+        run_live_clicked = st.button("🚀 Run Agent", type="primary", use_container_width=True)
+    with btn_col2:
+        run_mock_clicked = st.button("🧪 Run Demonstration", type="secondary", use_container_width=True)
+    with btn_col3:
+        if st.button("Clear", use_container_width=True):
+            handle_new_task()
+
+    # Trigger Agent Execution
+    if run_live_clicked:
+        if not user_prompt.strip():
+            st.warning("Please provide a task description.")
+        elif not has_key:
+            st.error("GROQ_API_KEY is not configured in .env. Click 'Run Demonstration' to run the offline test harness, or set your key in .env.")
         else:
-            st.error(files_result.get("error"))
+            run_agent_workflow(user_prompt, base_config, runtime_settings, use_mock=False)
+            st.rerun()
+
+    if run_mock_clicked:
+        prompt_to_use = user_prompt.strip() if user_prompt.strip() else "Create a script that computes numbers and verifies them with assertions."
+        run_agent_workflow(prompt_to_use, base_config, runtime_settings, use_mock=True)
+        st.rerun()
+
+    st.divider()
+
+    # Content Area
+    current_result: Optional[AgentResult] = st.session_state.current_result
+
+    if current_result is None:
+        # Show Welcome & Architecture Screen when idle
+        render_welcome_screen(on_example_selected=on_example_click)
+
+    else:
+        # Render Telemetry Metrics Bar
+        render_metrics(
+            iterations=current_result.iterations,
+            max_iterations=current_result.max_iterations,
+            correction_attempts=current_result.correction_attempts,
+            total_tokens=current_result.total_tokens
+        )
+
+        st.markdown("<br/>", unsafe_allow_html=True)
+
+        # Two-Column Developer Dashboard
+        col_left, col_right = st.columns([3, 2])
+
+        with col_left:
+            # 1. Final Verified Response
+            st.markdown("##### 📝 Final Agent Response")
+            if current_result.success:
+                st.success(current_result.final_response)
+            else:
+                st.error(current_result.final_response)
+
+            # 2. Tool Execution Timeline
+            st.markdown("##### ⏱️ Tool Execution History")
+            render_tool_timeline(current_result.action_history)
+
+        with col_right:
+            # 1. Workspace Code Viewer
+            st.markdown("##### 💻 Generated Code")
+            render_code_viewer(base_config.workspace_dir)
+
+            # 2. Latest Terminal Stream
+            st.markdown("##### 🖥️ Latest Execution Stream")
+            if current_result.execution_history:
+                last_exec = current_result.execution_history[-1]
+                render_terminal_output(
+                    stdout=last_exec.get("stdout") or "",
+                    stderr=last_exec.get("stderr") or "",
+                    exit_code=last_exec.get("exit_code"),
+                    timed_out=last_exec.get("timed_out", False)
+                )
+
+                # 3. Diagnostics Panel (if execution had errors)
+                if last_exec.get("diagnostics"):
+                    st.markdown("##### 🔍 Error Diagnostics")
+                    render_diagnostics(last_exec["diagnostics"])
+            else:
+                st.caption("No executions performed during this task.")
 
 
 if __name__ == "__main__":
-    render_ui()
+    main()
