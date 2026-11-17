@@ -127,3 +127,30 @@ class TestDefaultRegistryIntegration:
         assert exec_res["success"] is True
         assert exec_res["exit_code"] == 0
         assert "Dispatched via Registry!" in exec_res["stdout"]
+
+    def test_get_groq_schemas_format(self, test_config):
+        registry = create_default_registry(config=test_config)
+        schemas = registry.get_groq_schemas()
+
+        assert isinstance(schemas, list)
+        assert len(schemas) == 5
+
+        for schema in schemas:
+            assert schema["type"] == "function"
+            fn = schema["function"]
+            assert "name" in fn
+            assert "description" in fn
+            assert "parameters" in fn
+            assert fn["parameters"]["type"] == "object"
+            assert "properties" in fn["parameters"]
+            assert isinstance(fn["parameters"]["required"], list)
+
+        # Check create_file schema specifically
+        create_schema = next(s for s in schemas if s["function"]["name"] == "create_file")
+        props = create_schema["function"]["parameters"]["properties"]
+        assert "filename" in props
+        assert props["filename"]["type"] == "string"
+        assert "content" in props
+        assert props["content"]["type"] == "string"
+        assert "filename" in create_schema["function"]["parameters"]["required"]
+        assert "content" in create_schema["function"]["parameters"]["required"]

@@ -191,7 +191,7 @@ class TestPathTraversalSecurity:
 
         result = read_file(str(outside_file), config=test_config)
         assert result["success"] is False
-        assert "Path traversal detected" in result["error"]
+        assert ("Path traversal detected" in result["error"] or "Absolute path" in result["error"])
 
     def test_resolve_safe_path_empty_path(self, test_config):
         with pytest.raises(ValueError):

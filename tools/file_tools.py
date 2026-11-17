@@ -10,6 +10,7 @@ and returns structured tool response dictionaries.
 Security Model:
 - Path Jail: All operations resolve paths against Config.workspace_dir.
 - Traversal Guard: Prevents directory escapes such as '../../'.
+- Absolute Path Rejection: Disallows absolute filesystem paths.
 - Confirmation Guard: Overwriting or deleting existing files requires explicit approval.
 """
 
@@ -20,10 +21,10 @@ from config import Config, load_config
 
 def resolve_safe_path(target_path: str, workspace_dir: Path) -> Path:
     """
-    Resolve and validate that target_path resides strictly inside workspace_dir.
+    Resolve and validate that target_path is relative and resides strictly inside workspace_dir.
     
     Raises:
-        PermissionError: If target_path resolves outside workspace_dir (path traversal).
+        PermissionError: If target_path is absolute or resolves outside workspace_dir.
         ValueError: If target_path is empty.
     """
     if not target_path or not str(target_path).strip():
@@ -32,10 +33,14 @@ def resolve_safe_path(target_path: str, workspace_dir: Path) -> Path:
     clean_target = Path(target_path.strip())
     resolved_workspace = workspace_dir.resolve()
 
+    # Reject absolute paths upfront
     if clean_target.is_absolute():
-        resolved_target = clean_target.resolve()
-    else:
-        resolved_target = (resolved_workspace / clean_target).resolve()
+        raise PermissionError(
+            f"Security rejection: Absolute path '{target_path}' is forbidden. "
+            "All paths must be relative to the sandboxed workspace."
+        )
+
+    resolved_target = (resolved_workspace / clean_target).resolve()
 
     # Enforce directory jail: resolved_target must be relative to resolved_workspace
     try:
@@ -196,7 +201,6 @@ def list_files(
 
         entries = []
         for item in sorted(target_dir.iterdir()):
-            # Relative path from workspace root
             rel_item = item.relative_to(cfg.workspace_dir.resolve())
             is_file = item.is_file()
             size = item.stat().st_size if is_file else 0
