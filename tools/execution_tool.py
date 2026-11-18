@@ -10,10 +10,12 @@ scrubbing (removing GROQ_API_KEY and host credentials), and human approval gates
 import os
 import sys
 import time
+import re
+import shlex
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from config import Config, load_config
 from tools.file_tools import resolve_safe_path
@@ -241,3 +243,340 @@ def execute_python(
     """
     executor = LocalRestrictedExecutor(config=config)
     return executor.execute(filename=filename, approved=approved, timeout=timeout)
+
+
+# Allowed command prefixes for run_shell
+ALLOWED_COMMANDS = {"pytest", "python", "pip", "ls", "cat"}
+
+# Disallowed dangerous operators / tokens (e.g. redirection, chaining, traversal, escalation)
+DANGEROUS_TOKENS = {"rm", "sudo", "curl", "wget", "|", ";", "&&", ">", ">>", "<", ".."}
+
+
+def run_shell(
+    command: str,
+    approved: bool = False,
+    timeout: Optional[int] = None,
+    config: Optional[Config] = None
+) -> Dict[str, Any]:
+    """
+    Run an approved allowlisted command inside the sandboxed workspace without shell=True.
+
+    Allowlist:
+    - pytest, python, pip (install only), ls, cat.
+    - Dangerous tokens (rm, sudo, curl, wget, |, ;, &&, >, ..) are strictly blocked.
+
+    Args:
+        command: Command string to execute.
+        approved: User approval flag. Required if require_user_approval is enabled.
+        timeout: Execution timeout in seconds (defaults to config.execution_timeout_seconds).
+        config: Optional configuration instance.
+
+    Returns:
+        Structured result dict matching execute_python shape.
+    """
+    cfg = config or load_config(strict_api_key=False)
+
+    if not command or not command.strip():
+        return {
+            "success": False,
+            "command": command,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "execution_time_seconds": 0.0,
+            "mode": "restricted_shell",
+            "error": "Command string cannot be empty.",
+            "approval_required": False
+        }
+
+    # 1. Enforce Human-in-the-Loop approval gate
+    if cfg.require_user_approval and not approved:
+        return {
+            "success": False,
+            "command": command,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "execution_time_seconds": 0.0,
+            "mode": "restricted_shell",
+            "error": "Execution of shell commands requires explicit user approval.",
+            "approval_required": True
+        }
+
+    # 2. Split command using shlex
+    try:
+        args = shlex.split(command, posix=True)
+    except ValueError as exc:
+        return {
+            "success": False,
+            "command": command,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "execution_time_seconds": 0.0,
+            "mode": "restricted_shell",
+            "error": f"Failed to parse command line: {exc}",
+            "approval_required": False
+        }
+
+    if not args:
+        return {
+            "success": False,
+            "command": command,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "execution_time_seconds": 0.0,
+            "mode": "restricted_shell",
+            "error": "Parsed command is empty.",
+            "approval_required": False
+        }
+
+    # Check raw command and args for dangerous tokens / operators
+    for token in DANGEROUS_TOKENS:
+        # Check if token exists in args or raw command symbols
+        if token in args or (token in {"|", ";", "&&", ">", ">>", "<", ".."} and token in command):
+            return {
+                "success": False,
+                "command": command,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+                "execution_time_seconds": 0.0,
+                "mode": "restricted_shell",
+                "error": f"Security violation: Token or operator '{token}' is strictly forbidden.",
+                "approval_required": False
+            }
+
+    base_cmd = Path(args[0]).name.lower()
+    if base_cmd.endswith(".exe"):
+        base_cmd = base_cmd[:-4]
+
+    # Check allowlist
+    if base_cmd not in ALLOWED_COMMANDS:
+        return {
+            "success": False,
+            "command": command,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "execution_time_seconds": 0.0,
+            "mode": "restricted_shell",
+            "error": f"Command '{base_cmd}' is not in the allowlist ({sorted(ALLOWED_COMMANDS)}).",
+            "approval_required": False
+        }
+
+    # Check pip restriction: pip install only
+    if base_cmd == "pip":
+        if len(args) < 2 or args[1] != "install":
+            return {
+                "success": False,
+                "command": command,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+                "execution_time_seconds": 0.0,
+                "mode": "restricted_shell",
+                "error": "pip usage is restricted: only 'pip install' is permitted.",
+                "approval_required": False
+            }
+
+    # Check argument paths for directory traversal (".." or "../")
+    for arg in args[1:]:
+        if ".." in arg:
+            return {
+                "success": False,
+                "command": command,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+                "execution_time_seconds": 0.0,
+                "mode": "restricted_shell",
+                "error": f"Security violation: Path traversal '..' in argument '{arg}' is forbidden.",
+                "approval_required": False
+            }
+
+    # Resolve executable: use sys.executable if running python
+    exec_args = list(args)
+    if base_cmd == "python":
+        exec_args[0] = sys.executable
+
+    effective_timeout = timeout if timeout is not None else cfg.execution_timeout_seconds
+    child_env = build_sanitized_environment(cfg.workspace_dir)
+
+    start_time = time.perf_counter()
+    try:
+        process = subprocess.run(
+            exec_args,
+            cwd=str(cfg.workspace_dir.resolve()),
+            env=child_env,
+            capture_output=True,
+            text=True,
+            timeout=effective_timeout,
+            shell=False
+        )
+        elapsed = time.perf_counter() - start_time
+
+        return {
+            "success": (process.returncode == 0),
+            "command": command,
+            "exit_code": process.returncode,
+            "stdout": process.stdout,
+            "stderr": process.stderr,
+            "timed_out": False,
+            "execution_time_seconds": round(elapsed, 4),
+            "mode": "restricted_shell",
+            "error": None if process.returncode == 0 else "Command exited with non-zero exit code.",
+            "approval_required": False
+        }
+
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.perf_counter() - start_time
+        stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout.decode("utf-8", "replace") if exc.stdout else "")
+        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr.decode("utf-8", "replace") if exc.stderr else "")
+
+        return {
+            "success": False,
+            "command": command,
+            "exit_code": -1,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": True,
+            "execution_time_seconds": round(elapsed, 4),
+            "mode": "restricted_shell",
+            "error": f"Command timed out after {effective_timeout} seconds.",
+            "approval_required": False
+        }
+
+    except Exception as exc:
+        elapsed = time.perf_counter() - start_time
+        return {
+            "success": False,
+            "command": command,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": str(exc),
+            "timed_out": False,
+            "execution_time_seconds": round(elapsed, 4),
+            "mode": "restricted_shell",
+            "error": f"Unexpected execution error: {exc}",
+            "approval_required": False
+        }
+
+
+def run_tests(
+    path: str = "",
+    approved: bool = False,
+    timeout: Optional[int] = None,
+    config: Optional[Config] = None
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper that runs pytest inside workspace/ and returns a compact
+    pass/fail summary along with names of failing tests.
+
+    Args:
+        path: Optional relative test file or test folder path inside workspace/.
+        approved: User approval flag. Required if require_user_approval is enabled.
+        timeout: Execution timeout in seconds.
+        config: Optional configuration instance.
+
+    Returns:
+        Structured test run dictionary with summary metrics and failure details.
+    """
+    cfg = config or load_config(strict_api_key=False)
+
+    # Validate path if provided
+    if path and path.strip():
+        try:
+            target = resolve_safe_path(path, cfg.workspace_dir)
+            if not target.exists():
+                return {
+                    "success": False,
+                    "path": path,
+                    "exit_code": None,
+                    "error": f"Test path not found in workspace: '{path}'",
+                    "approval_required": False,
+                    "summary": "Path not found",
+                    "failed_tests": []
+                }
+            pytest_target = str(target.relative_to(cfg.workspace_dir.resolve())).replace("\\", "/")
+        except (PermissionError, ValueError) as err:
+            return {
+                "success": False,
+                "path": path,
+                "exit_code": None,
+                "error": str(err),
+                "approval_required": False,
+                "summary": "Invalid test path",
+                "failed_tests": []
+            }
+    else:
+        pytest_target = ""
+
+    # Build pytest command: run pytest module via sys.executable
+    cmd_parts = ["python", "-m", "pytest", "-q"]
+    if pytest_target:
+        cmd_parts.append(pytest_target)
+    cmd_str = " ".join(cmd_parts)
+
+    shell_result = run_shell(
+        command=cmd_str,
+        approved=approved,
+        timeout=timeout,
+        config=cfg
+    )
+
+    if not shell_result.get("success", False) and shell_result.get("approval_required"):
+        return {
+            "success": False,
+            "path": path,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "error": "Running tests requires explicit user approval.",
+            "approval_required": True,
+            "summary": "Approval required",
+            "failed_tests": []
+        }
+
+    stdout = shell_result.get("stdout", "")
+    stderr = shell_result.get("stderr", "")
+    exit_code = shell_result.get("exit_code")
+
+    # Parse failed test names from pytest output
+    # Typical pytest output lines:
+    # FAILED test_calc.py::test_fail - AssertionError
+    failed_tests: List[str] = []
+    for line in (stdout + "\n" + stderr).splitlines():
+        line_clean = line.strip()
+        if line_clean.startswith("FAILED "):
+            test_id = line_clean.split()[1] if len(line_clean.split()) > 1 else line_clean
+            failed_tests.append(test_id)
+
+    # Derive compact summary
+    summary = "Tests passed successfully" if exit_code == 0 else f"{len(failed_tests)} test(s) failed"
+    if shell_result.get("timed_out"):
+        summary = "Test run timed out"
+
+    return {
+        "success": (exit_code == 0),
+        "path": path,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": shell_result.get("timed_out", False),
+        "execution_time_seconds": shell_result.get("execution_time_seconds", 0.0),
+        "summary": summary,
+        "failed_tests": failed_tests,
+        "error": shell_result.get("error"),
+        "approval_required": False
+    }
+

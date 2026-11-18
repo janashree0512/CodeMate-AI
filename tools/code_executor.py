@@ -6,6 +6,8 @@ from tools.execution_tool import (
     LocalRestrictedExecutor,
     build_sanitized_environment,
     execute_python,
+    run_shell,
+    run_tests,
 )
 
 __all__ = [
@@ -13,4 +15,6 @@ __all__ = [
     "LocalRestrictedExecutor",
     "build_sanitized_environment",
     "execute_python",
+    "run_shell",
+    "run_tests",
 ]

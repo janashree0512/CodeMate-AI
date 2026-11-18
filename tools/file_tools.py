@@ -280,3 +280,177 @@ def delete_file(
         return {"success": False, "filename": filename, "error": str(err)}
     except OSError as err:
         return {"success": False, "filename": filename, "error": f"OS error deleting file: {err}"}
+
+
+def edit_file(
+    filename: str,
+    old_text: str,
+    new_text: str,
+    approved: bool = False,
+    config: Optional[Config] = None
+) -> Dict[str, Any]:
+    """
+    Replace exactly one occurrence of old_text with new_text in a workspace file.
+
+    Args:
+        filename: Relative path of the file in workspace.
+        old_text: The exact text snippet to replace.
+        new_text: The replacement text snippet.
+        approved: User approval flag required when require_user_approval is enabled.
+        config: Optional configuration instance.
+
+    Returns:
+        Structured response dictionary.
+    """
+    cfg = config or load_config(strict_api_key=False)
+    try:
+        target = resolve_safe_path(filename, cfg.workspace_dir)
+
+        if not target.exists():
+            return {
+                "success": False,
+                "filename": filename,
+                "error": f"File not found: '{filename}'"
+            }
+
+        if target.is_dir():
+            return {
+                "success": False,
+                "filename": filename,
+                "error": f"Path '{filename}' is a directory, not a file."
+            }
+
+        if not old_text:
+            return {
+                "success": False,
+                "filename": filename,
+                "error": "old_text cannot be empty."
+            }
+
+        # Enforce approval gate if configured
+        if cfg.require_user_approval and not approved:
+            return {
+                "success": False,
+                "filename": filename,
+                "error": f"Editing '{filename}' modifies workspace code and requires explicit user approval.",
+                "approval_required": True
+            }
+
+        content = target.read_text(encoding="utf-8")
+        occurrences = content.count(old_text)
+
+        if occurrences == 0:
+            return {
+                "success": False,
+                "filename": filename,
+                "error": f"old_text not found in '{filename}'. Ensure the exact snippet matches."
+            }
+
+        if occurrences > 1:
+            return {
+                "success": False,
+                "filename": filename,
+                "error": (
+                    f"old_text found {occurrences} times in '{filename}'. "
+                    "edit_file requires exactly one match. Provide more surrounding context."
+                )
+            }
+
+        updated_content = content.replace(old_text, new_text, 1)
+        target.write_text(updated_content, encoding="utf-8")
+
+        return {
+            "success": True,
+            "filename": filename,
+            "occurrences_replaced": 1,
+            "message": f"Successfully updated '{filename}'."
+        }
+
+    except (PermissionError, ValueError) as err:
+        return {"success": False, "filename": filename, "error": str(err)}
+    except OSError as err:
+        return {"success": False, "filename": filename, "error": f"OS error editing file: {err}"}
+
+
+def search_files(
+    pattern: str,
+    directory: str = "",
+    config: Optional[Config] = None
+) -> Dict[str, Any]:
+    """
+    Grep-like search for a text pattern across workspace files.
+
+    Args:
+        pattern: Substring or text pattern to search for.
+        directory: Relative subfolder inside workspace to search within (default: entire workspace).
+        config: Optional configuration instance.
+
+    Returns:
+        Structured response dictionary with list of matches (capped at 50).
+    """
+    cfg = config or load_config(strict_api_key=False)
+    try:
+        if not pattern:
+            return {
+                "success": False,
+                "pattern": pattern,
+                "error": "Search pattern cannot be empty."
+            }
+
+        target_dir = resolve_safe_path(directory if directory else ".", cfg.workspace_dir)
+
+        if not target_dir.exists():
+            return {
+                "success": False,
+                "directory": directory,
+                "error": f"Directory not found: '{directory}'"
+            }
+
+        if not target_dir.is_dir():
+            return {
+                "success": False,
+                "directory": directory,
+                "error": f"Path '{directory}' is a file, not a directory."
+            }
+
+        matches = []
+        resolved_workspace = cfg.workspace_dir.resolve()
+        max_matches = 50
+
+        # Recursively search all files under target_dir
+        for file_path in sorted(target_dir.rglob("*")):
+            if not file_path.is_file():
+                continue
+
+            rel_path = file_path.relative_to(resolved_workspace).as_posix()
+
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+
+            for line_no, line in enumerate(content.splitlines(), start=1):
+                if pattern in line:
+                    matches.append({
+                        "filename": rel_path,
+                        "line_number": line_no,
+                        "line": line
+                    })
+                    if len(matches) >= max_matches:
+                        break
+            if len(matches) >= max_matches:
+                break
+
+        return {
+            "success": True,
+            "pattern": pattern,
+            "total_matches": len(matches),
+            "capped": len(matches) >= max_matches,
+            "matches": matches
+        }
+
+    except (PermissionError, ValueError) as err:
+        return {"success": False, "pattern": pattern, "error": str(err)}
+    except OSError as err:
+        return {"success": False, "pattern": pattern, "error": f"OS error searching files: {err}"}
+
