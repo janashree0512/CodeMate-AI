@@ -105,11 +105,18 @@ def run_cli():
 
     print_banner()
 
-    # Inform user about API key status
-    has_key = bool(config.groq_api_key and config.groq_api_key != "your_groq_api_key_here")
-    if not has_key:
-        print("\n[WARNING] GROQ_API_KEY is not configured in .env.")
-        print("Live model queries will fail. Set your key in .env or run offline tests.\n")
+    # Inform user about API key status with specific diagnostics
+    target_env = config.project_root / ".env"
+    if not target_env.exists():
+        print(f"\n[CONFIG ERROR] .env not found at {target_env.resolve()}\n")
+    elif not config.groq_api_key or config.groq_api_key == "your_groq_api_key_here":
+        print("\n[CONFIG ERROR] GROQ_API_KEY is empty or still the placeholder in .env\n")
+    elif not config.groq_api_key.startswith("gsk_"):
+        masked = f"{config.groq_api_key[:4]}...{config.groq_api_key[-4:]}" if len(config.groq_api_key) > 8 else "[INVALID]"
+        print(f"\n[CONFIG WARNING] Key should start with gsk_ (check for a copy/paste mistake; found {masked})\n")
+    else:
+        masked = f"{config.groq_api_key[:4]}...{config.groq_api_key[-4:]}"
+        print(f"\n[CONFIG OK] GROQ_API_KEY configured ({masked})\n")
 
     registry = create_default_registry(config=config)
     # By default, auto_approve matches require_user_approval
@@ -145,7 +152,7 @@ def run_cli():
             continue
 
         # Run agent on task
-        print(f"\n[Running Agent on Task]: {user_input}")
+        print(f"\n[Running Agent on Task with model '{config.model_name}']: {user_input}")
         print("-" * 65)
 
         try:
@@ -154,6 +161,7 @@ def run_cli():
             print("-" * 65)
             print(f"\n[Execution Summary]")
             print(f"  Status: {'SUCCESS' if result.success else 'FAILED'}")
+            print(f"  Model: {config.model_name}")
             print(f"  Iterations: {result.iterations} / {result.max_iterations}")
             print(f"  Termination Reason: {result.termination_reason}")
             print(f"  Correction Attempts: {result.correction_attempts}")

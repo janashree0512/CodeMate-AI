@@ -13,7 +13,7 @@ Renders the professional developer sidebar:
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 import streamlit as st
-from config import Config
+from config import Config, DEFAULT_MODEL, SUPPORTED_MODELS
 
 
 def render_sidebar(
@@ -66,15 +66,15 @@ def render_sidebar(
         # Agent Settings & Boundaries
         st.markdown("##### ⚙️ Runtime Settings")
 
-        model_options = [
-            "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
-            "llama3-70b-8192"
-        ]
+        model_options = list(SUPPORTED_MODELS)
+        if config.model_name and config.model_name not in model_options:
+            model_options.append(config.model_name)
+
+        current_selection = config.model_name if config.model_name in model_options else DEFAULT_MODEL
         selected_model = st.selectbox(
             "Model",
             model_options,
-            index=0 if config.model_name not in model_options else model_options.index(config.model_name)
+            index=model_options.index(current_selection)
         )
 
         max_iter = st.slider(
@@ -98,13 +98,19 @@ def render_sidebar(
             value=config.require_user_approval
         )
 
-        # API Key Status (Never prints or exposes secret key)
+        # Setup Check Status in Sidebar
         st.divider()
-        has_key = bool(config.groq_api_key and config.groq_api_key != "your_groq_api_key_here")
-        if has_key:
-            st.success("API Key: Configured in .env")
+        st.markdown("##### 🔍 Setup Check")
+        env_file = config.project_root / ".env"
+        if not env_file.exists():
+            st.error(f"❌ `.env` missing at: `{env_file.name}`")
+        elif not config.groq_api_key or config.groq_api_key == "your_groq_api_key_here":
+            st.error("❌ `GROQ_API_KEY` is empty or placeholder in `.env`")
+        elif not config.groq_api_key.startswith("gsk_"):
+            st.warning("⚠️ Key does not start with `gsk_`")
         else:
-            st.warning("API Key: Not Found (Offline Mock Mode Available)")
+            masked = f"{config.groq_api_key[:4]}...{config.groq_api_key[-4:]}"
+            st.success(f"✅ Key Configured ({masked})")
 
         return {
             "model_name": selected_model,

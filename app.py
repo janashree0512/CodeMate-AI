@@ -11,7 +11,6 @@ import sys
 import streamlit as st
 from pathlib import Path
 from typing import Any, Dict, Optional
-from unittest.mock import MagicMock
 
 from config import Config, load_config
 from agent.agent import CodeMateAgent, AgentResult, run_agent
@@ -50,13 +49,15 @@ def init_session_state(config: Config):
 def run_agent_workflow(
     task: str,
     config: Config,
-    runtime_settings: Dict[str, Any],
-    use_mock: bool = False
+    runtime_settings: Dict[str, Any]
 ):
     """
-    Execute the agent ReAct loop with progress indication and error boundaries.
+    Execute the agent ReAct loop with real GroqClient, progress indication, and error boundaries.
+    Clears any prior results before running.
     """
-    st.session_state.agent_status = "running"
+    # Fix stale results: Clear previous run data from session state
+    st.session_state["current_result"] = None
+    st.session_state["agent_status"] = "running"
 
     # Merge runtime settings with base configuration
     effective_config = Config(
@@ -70,83 +71,26 @@ def run_agent_workflow(
         workspace_dir=config.workspace_dir,
         project_root=config.project_root
     )
+    st.session_state["last_run_model"] = effective_config.model_name
 
     registry = create_default_registry(config=effective_config)
 
-    # Handle mock / offline demonstration mode
-    if use_mock:
-        mock_llm = MagicMock()
-        mock_llm.format_tool_schema.return_value = [{"type": "function"}]
-
-        resp_1 = LLMResponse(
-            content="I will generate a Python script to address your task.",
-            tool_calls=[
-                ToolCallRequest(
-                    id="call_mock_1",
-                    tool_name="create_file",
-                    arguments={
-                        "filename": "generated_solution.py",
-                        "content": (
-                            "def solve():\n"
-                            "    items = [x**2 for x in range(1, 6)]\n"
-                            "    print('Computed squares:', items)\n"
-                            "    assert items == [1, 4, 9, 16, 25]\n"
-                            "    return items\n\n"
-                            "if __name__ == '__main__':\n"
-                            "    solve()\n"
-                        )
-                    }
-                )
-            ]
-        )
-        resp_2 = LLMResponse(
-            content="Script created. Now executing to verify assertions in the sandbox.",
-            tool_calls=[
-                ToolCallRequest(
-                    id="call_mock_2",
-                    tool_name="execute_python",
-                    arguments={"filename": "generated_solution.py"}
-                )
-            ]
-        )
-        resp_3 = LLMResponse(
-            content=(
-                "The script 'generated_solution.py' was created and executed in the workspace sandbox.\n"
-                "Execution Output: Computed squares: [1, 4, 9, 16, 25]\n"
-                "All assertions passed successfully."
-            ),
-            tool_calls=[]
-        )
-        final_resp = LLMResponse(
-            content="✅ All steps completed. No further tool calls needed.",
-            tool_calls=[]
-        )
-        mock_llm.chat.side_effect = [resp_1, resp_2, resp_3, final_resp]
-        # In demonstration (mock) mode, show a prominent banner explaining that approvals are bypassed
-        st.info("ℹ️ Demo mode: approvals disabled, mock LLM, not a real run")
-        agent = CodeMateAgent(
-            config=effective_config,
-            registry=registry,
-            llm_client=mock_llm,
-            auto_approve=True
-        )
-    else:
-        # Live execution with Groq API: strictly respect user's approval setting
-        agent = CodeMateAgent(
-            config=effective_config,
-            registry=registry,
-            auto_approve=not effective_config.require_user_approval
-        )
+    # Always use the real agent with GroqClient
+    agent = CodeMateAgent(
+        config=effective_config,
+        registry=registry,
+        auto_approve=not effective_config.require_user_approval
+    )
 
     try:
-        with st.spinner("Agent is planning, generating code, and verifying in the sandbox..."):
+        with st.spinner(f"Agent ({effective_config.model_name}) is planning, generating code, and verifying in the sandbox..."):
             result: AgentResult = agent.run(task=task)
 
-        st.session_state.current_result = result
-        st.session_state.agent_status = "completed" if result.success else "failed"
+        st.session_state["current_result"] = result
+        st.session_state["agent_status"] = "completed" if result.success else "failed"
 
         # Record into task history
-        st.session_state.tasks_history.append({
+        st.session_state["tasks_history"].append({
             "task": task,
             "success": result.success,
             "iterations": result.iterations,
@@ -154,12 +98,12 @@ def run_agent_workflow(
         })
 
     except LLMAuthenticationError as err:
-        st.session_state.agent_status = "failed"
+        st.session_state["agent_status"] = "failed"
         st.error(f"**Groq Authentication Error**: {err}")
-        st.info("Set your valid `GROQ_API_KEY` in `.env` or run in **Demonstration Mode** below.")
+        st.info("Please set your valid `GROQ_API_KEY` in the `.env` file to use CodeMate AI.")
 
     except Exception as err:
-        st.session_state.agent_status = "failed"
+        st.session_state["agent_status"] = "failed"
         st.error(f"**Agent Error**: {err}")
 
 
@@ -227,31 +171,32 @@ def main():
     )
 
     # Action Buttons Row
-    btn_col1, btn_col2, btn_col3, _ = st.columns([1.2, 1.8, 1.2, 4])
-    has_key = bool(base_config.groq_api_key and base_config.groq_api_key != "your_groq_api_key_here")
+    btn_col1, btn_col2, _ = st.columns([1.5, 1.2, 5])
 
     with btn_col1:
         run_live_clicked = st.button("🚀 Run Agent", type="primary", use_container_width=True)
     with btn_col2:
-        run_mock_clicked = st.button("🧪 Run Demonstration", type="secondary", use_container_width=True)
-    with btn_col3:
         if st.button("Clear", use_container_width=True):
             handle_new_task()
 
     # Trigger Agent Execution
     if run_live_clicked:
-        if not user_prompt.strip():
-            st.warning("Please provide a task description.")
-        elif not has_key:
-            st.error("GROQ_API_KEY is not configured in .env. Click 'Run Demonstration' to run the offline test harness, or set your key in .env.")
-        else:
-            run_agent_workflow(user_prompt, base_config, runtime_settings, use_mock=False)
-            st.rerun()
+        # Re-read fresh config from .env on every run
+        fresh_config = load_config(strict_api_key=False)
+        target_env = fresh_config.project_root / ".env"
 
-    if run_mock_clicked:
-        prompt_to_use = user_prompt.strip() if user_prompt.strip() else "Create a script that computes numbers and verifies them with assertions."
-        run_agent_workflow(prompt_to_use, base_config, runtime_settings, use_mock=True)
-        st.rerun()
+        if not user_prompt.strip():
+            st.warning("Please provide a programming task description.")
+        elif not target_env.exists():
+            st.error(f".env not found at {target_env.resolve()}")
+        elif not fresh_config.groq_api_key or fresh_config.groq_api_key == "your_groq_api_key_here":
+            st.error("GROQ_API_KEY is empty or still the placeholder in .env")
+        elif not fresh_config.groq_api_key.startswith("gsk_"):
+            masked = f"{fresh_config.groq_api_key[:4]}...{fresh_config.groq_api_key[-4:]}" if len(fresh_config.groq_api_key) > 8 else "[INVALID]"
+            st.error(f"Key should start with gsk_ (check for a copy/paste mistake; found {masked})")
+        else:
+            run_agent_workflow(user_prompt, fresh_config, runtime_settings)
+            st.rerun()
 
     st.divider()
 
@@ -263,6 +208,17 @@ def main():
         render_welcome_screen(on_example_selected=on_example_click)
 
     else:
+        # Header Badge displaying Real Model Information used for this run
+        active_model = st.session_state.get("last_run_model", runtime_settings.get("model_name", base_config.model_name))
+        st.markdown(
+            f"<div style='margin-bottom: 15px; padding: 6px 12px; background-color: #1E293B; "
+            f"border-left: 4px solid #3B82F6; border-radius: 4px; font-size: 0.85rem; color: #94A3B8;'>"
+            f"🔵 <strong>LIVE RUN:</strong> Model: <code style='color: #60A5FA;'>{active_model}</code> &nbsp;|&nbsp; "
+            f"Task: <em>{current_result.task[:70]}{'...' if len(current_result.task) > 70 else ''}</em>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
         # Render Telemetry Metrics Bar
         render_metrics(
             iterations=current_result.iterations,

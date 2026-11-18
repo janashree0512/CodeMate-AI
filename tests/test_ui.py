@@ -7,7 +7,7 @@ and metric formatting without requiring a live browser.
 from unittest.mock import MagicMock, patch
 import pytest
 
-from config import Config
+from config import Config, DEFAULT_MODEL
 from ui.styles import CUSTOM_CSS
 from ui.views import render_status_badge, render_metrics
 import app
@@ -17,7 +17,7 @@ import app
 def test_config(tmp_path):
     return Config(
         groq_api_key="mock",
-        model_name="llama-3.3-70b-versatile",
+        model_name=DEFAULT_MODEL,
         max_iterations=5,
         execution_timeout_seconds=5,
         require_user_approval=True,
@@ -68,3 +68,64 @@ def test_init_session_state(test_config):
         assert "current_result" in mock_session
         assert "agent_status" in mock_session
         assert mock_session["agent_status"] == "idle"
+
+
+def test_missing_api_key_prevents_mock_run_in_workflow(test_config):
+    """Test that run_agent_workflow never starts a mock run and raises or reports error on bad key."""
+    bad_config = Config(
+        groq_api_key="",
+        model_name=DEFAULT_MODEL,
+        max_iterations=5,
+        execution_timeout_seconds=5,
+        require_user_approval=True,
+        workspace_dir=test_config.workspace_dir,
+        project_root=test_config.project_root,
+        max_tool_output_chars=4000,
+        max_history_messages=30
+    )
+    mock_session = {
+        "tasks_history": [],
+        "current_result": "stale_result",
+        "agent_status": "idle"
+    }
+    with patch("streamlit.session_state", mock_session), \
+         patch("streamlit.error") as mock_err, \
+         patch("streamlit.info"):
+        app.run_agent_workflow(
+            task="Compute primes",
+            config=bad_config,
+            runtime_settings={"model_name": DEFAULT_MODEL, "require_approval": False}
+        )
+        assert mock_session["agent_status"] == "failed"
+        mock_err.assert_called_once()
+        assert "Authentication Error" in mock_err.call_args[0][0]
+
+
+def test_session_state_cleared_between_runs(test_config):
+    """Verify that prior results are wiped from session state when a new run begins."""
+    mock_session = {
+        "tasks_history": [],
+        "current_result": {"stale": "data"},
+        "agent_status": "completed"
+    }
+    # Mock agent.run to inspect session_state right after run_agent_workflow initializes
+    with patch("streamlit.session_state", mock_session), \
+         patch("app.CodeMateAgent") as mock_agent_cls, \
+         patch("streamlit.spinner"):
+        mock_instance = MagicMock()
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.iterations = 2
+        mock_instance.run.return_value = mock_result
+        mock_agent_cls.return_value = mock_instance
+
+        app.run_agent_workflow(
+            task="New fresh task",
+            config=test_config,
+            runtime_settings={"model_name": DEFAULT_MODEL, "require_approval": False}
+        )
+        # Should record the new task and result
+        assert mock_session["current_result"] == mock_result
+        assert mock_session["agent_status"] == "completed"
+        assert len(mock_session["tasks_history"]) == 1
+        assert mock_session["tasks_history"][0]["task"] == "New fresh task"
