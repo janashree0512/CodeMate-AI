@@ -82,6 +82,10 @@ class Config:
     # Safety Controls
     require_user_approval: bool
 
+    # Output / history limits (Stage 2)
+    max_tool_output_chars: int      # Truncate tool output sent to LLM
+    max_history_messages: int       # Cap total conversation messages
+
     # Sandboxed Workspace Path
     workspace_dir: Path
 
@@ -155,6 +159,18 @@ def load_config(env_file: Optional[Path | str] = None, strict_api_key: bool = Fa
         default=True
     )
 
+    # 5a. Parse output / history limits (Stage 2)
+    max_tool_output_chars = parse_positive_int(
+        "MAX_TOOL_OUTPUT_CHARS",
+        os.getenv("MAX_TOOL_OUTPUT_CHARS"),
+        default=4000
+    )
+    max_history_messages = parse_positive_int(
+        "MAX_HISTORY_MESSAGES",
+        os.getenv("MAX_HISTORY_MESSAGES"),
+        default=30
+    )
+
     # 5. Resolve workspace directory path
     raw_workspace = os.getenv("WORKSPACE_DIR", "workspace").strip()
     workspace_path = Path(raw_workspace)
@@ -170,6 +186,8 @@ def load_config(env_file: Optional[Path | str] = None, strict_api_key: bool = Fa
         max_iterations=max_iterations,
         execution_timeout_seconds=execution_timeout_seconds,
         require_user_approval=require_user_approval,
+        max_tool_output_chars=max_tool_output_chars,
+        max_history_messages=max_history_messages,
         workspace_dir=workspace_path,
         project_root=PROJECT_ROOT
     )

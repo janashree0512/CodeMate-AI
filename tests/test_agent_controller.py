@@ -25,7 +25,9 @@ def agent_config(tmp_path):
         execution_timeout_seconds=5,
         require_user_approval=True,
         workspace_dir=workspace,
-        project_root=tmp_path
+        project_root=tmp_path,
+        max_tool_output_chars=4000,
+        max_history_messages=30
     )
 
 

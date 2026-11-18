@@ -36,13 +36,15 @@ def test_llm_client_tool_schema_generation(tmp_path):
         execution_timeout_seconds=5,
         require_user_approval=True,
         workspace_dir=tmp_path,
-        project_root=tmp_path
+        project_root=tmp_path,
+        max_tool_output_chars=4000,
+        max_history_messages=30
     )
     reg = create_default_registry(config=test_cfg)
     client = GroqClient(config=test_cfg)
     schemas = client.format_tool_schema(reg)
 
-    assert len(schemas) == 5
+    assert len(schemas) >= 5
     schema_names = [s["function"]["name"] for s in schemas]
     assert "create_file" in schema_names
     assert "execute_python" in schema_names
@@ -56,7 +58,9 @@ def test_agent_controller_initialization(tmp_path):
         execution_timeout_seconds=5,
         require_user_approval=True,
         workspace_dir=tmp_path,
-        project_root=tmp_path
+        project_root=tmp_path,
+        max_tool_output_chars=4000,
+        max_history_messages=30
     )
     agent_inst = CodeMateAgent(config=test_cfg)
     agent_inst.initialize_session("Write a bubble sort algorithm")

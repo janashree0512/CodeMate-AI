@@ -17,10 +17,11 @@ Self-Correction Workflow:
 7. Re-execute and observe until verified success or max retries
 """
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import Config, load_config
 from agent.prompts import SYSTEM_PROMPT
@@ -39,6 +40,93 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+
+
+def truncate_tool_output(result: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
+    """
+    Truncate large text fields (stdout, stderr, content) in tool results
+    before sending them back to the LLM context.
+    """
+    if max_chars <= 0:
+        return result
+
+    sanitized = dict(result)
+    for key in ("stdout", "stderr", "content"):
+        val = sanitized.get(key)
+        if isinstance(val, str) and len(val) > max_chars:
+            truncated_len = len(val) - max_chars
+            sanitized[key] = val[:max_chars] + f"...[truncated {truncated_len} chars]"
+    return sanitized
+
+
+def compress_conversation_history(messages: List[Dict[str, Any]], max_messages: int) -> List[Dict[str, Any]]:
+    """
+    Keep total conversation history under max_messages while preserving:
+    1. System prompt (messages[0])
+    2. Original user task (messages[1])
+    3. Tool-call / tool-result pairing integrity (never split an assistant message from its tool response)
+    Oldest intermediate tool messages are compressed into compact summaries.
+    """
+    if len(messages) <= max_messages or len(messages) <= 3:
+        return messages
+
+    # Always keep system prompt and original task
+    system_msg = messages[0]
+    user_task_msg = messages[1]
+    rest = list(messages[2:])
+
+    # We need to drop/compress from the front of `rest` until total <= max_messages
+    # Make sure we don't break tool_call - tool result pairs.
+    # Group messages into coherent units:
+    # An assistant message with tool_calls followed by its tool responses is a single unit.
+    units: List[List[Dict[str, Any]]] = []
+    i = 0
+    while i < len(rest):
+        msg = rest[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            unit = [msg]
+            i += 1
+            while i < len(rest) and rest[i].get("role") == "tool":
+                unit.append(rest[i])
+                i += 1
+            units.append(unit)
+        else:
+            units.append([msg])
+            i += 1
+
+    # While total count exceeds max_messages, compress the oldest unit if it's a tool-call unit
+    # A compressed unit becomes a single user/system note or compressed assistant note
+    compressed_units: List[List[Dict[str, Any]]] = []
+    total_msgs = 2 + sum(len(u) for u in units)
+
+    for idx, unit in enumerate(units):
+        # Keep compressing oldest units until total_msgs <= max_messages or only recent 2 units remain
+        if total_msgs > max_messages and idx < len(units) - 2:
+            tool_names = []
+            for m in unit:
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    for tc in m["tool_calls"]:
+                        fn = tc.get("function", {}).get("name", "unknown")
+                        tool_names.append(fn)
+            summary_text = f"[Prior step summary: Agent executed tool(s): {', '.join(tool_names) if tool_names else 'action'}]"
+            compressed_msg = {"role": "system", "content": summary_text}
+            total_msgs = total_msgs - len(unit) + 1
+            compressed_units.append([compressed_msg])
+        else:
+            compressed_units.append(unit)
+
+    # If still exceeding max_messages due to many single compressed summaries, drop oldest summaries
+    flattened = [system_msg, user_task_msg]
+    body: List[Dict[str, Any]] = []
+    for u in compressed_units:
+        body.extend(u)
+
+    if len(body) + 2 > max_messages:
+        # Keep the most recent (max_messages - 2) messages from body
+        body = body[-(max_messages - 2):]
+
+    flattened.extend(body)
+    return flattened
 
 
 @dataclass
@@ -61,7 +149,17 @@ class AgentExecutionState:
         self.completed = False
         self.success = False
         self.error_count = 0
+        self.plan: List[str] = []
         self.action_logs: List[Dict[str, Any]] = []
+
+    def set_plan(self, steps: List[str]) -> None:
+        """Store or update the numbered task plan."""
+        self.plan = [str(step).strip() for step in steps if str(step).strip()]
+        self.log_action("update_plan", {"plan": list(self.plan), "step_count": len(self.plan)})
+
+    def get_plan(self) -> List[str]:
+        """Return the current task plan."""
+        return list(self.plan)
 
     def log_action(self, action_type: str, details: Dict[str, Any]) -> None:
         """Record an action summary for the user interface."""
@@ -85,6 +183,7 @@ class AgentResult:
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_tokens: int = 0
+    plan: List[str] = field(default_factory=list)
     execution_history: List[Dict[str, Any]] = field(default_factory=list)
     action_history: List[ToolExecutionRecord] = field(default_factory=list)
     messages: List[Dict[str, Any]] = field(default_factory=list)
@@ -136,6 +235,36 @@ class CodeMateAgent:
     def get_conversation_history(self) -> List[Dict[str, Any]]:
         """Return the current conversation message thread."""
         return list(self.messages)
+
+    def update_plan(self, steps: List[str]) -> Dict[str, Any]:
+        """
+        Store or update a numbered task plan in the agent execution state.
+        """
+        if self.state is None:
+            return {"success": False, "error": "Agent session has not been initialized."}
+        if not isinstance(steps, list):
+            return {"success": False, "error": "steps must be a list of strings."}
+
+        self.state.set_plan(steps)
+        return {
+            "success": True,
+            "message": f"Plan updated with {len(self.state.plan)} steps.",
+            "plan": self.state.get_plan()
+        }
+
+    def show_plan(self) -> Dict[str, Any]:
+        """
+        Return the current numbered task plan.
+        """
+        if self.state is None:
+            return {"success": False, "error": "Agent session has not been initialized."}
+
+        plan = self.state.get_plan()
+        return {
+            "success": True,
+            "plan": plan,
+            "total_steps": len(plan)
+        }
 
     def execute_step(self) -> Dict[str, Any]:
         """
@@ -244,6 +373,18 @@ class CodeMateAgent:
         if self.state:
             self.state.max_iterations = limit
 
+        # Bind plan tools to the current agent state dynamically
+        self.registry.register(
+            name="update_plan",
+            description="Store or update a numbered step-by-step task plan. Call this first for multi-step tasks.",
+            func=self.update_plan
+        )
+        self.registry.register(
+            name="show_plan",
+            description="View the current active task plan.",
+            func=self.show_plan
+        )
+
         action_history: List[ToolExecutionRecord] = []
         execution_history: List[Dict[str, Any]] = []
         correction_attempts = 0
@@ -259,11 +400,17 @@ class CodeMateAgent:
         tool_schemas = self.llm_client.format_tool_schema(self.registry)
 
         # 2. Main Agent Execution Loop
+        failure_tracker: Dict[str, int] = {}
+        repeated_failure_intervened: bool = False
+
         while current_iteration < limit:
             current_iteration += 1
             if self.state:
                 self.state.current_iteration = current_iteration
             logger.info("=== Agent Loop Iteration %d / %d ===", current_iteration, limit)
+
+            # Stage 2: Enforce conversation history ceiling
+            self.messages = compress_conversation_history(self.messages, self.config.max_history_messages)
 
             # Step A: Query LLM with current conversation history and available tools
             llm_response: LLMResponse = self.llm_client.chat(
@@ -304,11 +451,61 @@ class CodeMateAgent:
                 self.messages.append(assistant_tool_msg)
 
                 # Step C: Execute each tool call and append 'tool' response messages
+                abort_for_repeated_failure = False
+
                 for tool_call in llm_response.tool_calls:
+                    # Check if tool call arguments was a malformed JSON error from llm_client
+                    if isinstance(tool_call.arguments, dict) and tool_call.arguments.get("__error__") == "malformed_json":
+                        raw_invalid = tool_call.arguments.get("raw", "")
+                        logger.warning("[Iter %d] Malformed JSON received for tool '%s': %s", current_iteration, tool_call.tool_name, raw_invalid)
+                        tool_response_msg: Dict[str, Any] = {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.tool_name,
+                            "content": json.dumps({
+                                "success": False,
+                                "error": f"Invalid JSON in tool call arguments for '{tool_call.tool_name}'. Please resend the tool call with strictly valid JSON syntax."
+                            })
+                        }
+                        self.messages.append(tool_response_msg)
+                        continue
+
                     record = self._execute_tool_call(tool_call, current_iteration)
                     action_history.append(record)
                     if self.state:
                         self.state.log_action(tool_call.tool_name, record.result)
+
+                    # Stage 2: Repeated-failure tracking
+                    if not record.success:
+                        err_str = str(record.result.get("error", ""))
+                        call_key = f"{tool_call.tool_name}::{json.dumps(tool_call.arguments, sort_keys=True)}::{err_str}"
+                        failure_tracker[call_key] = failure_tracker.get(call_key, 0) + 1
+
+                        if failure_tracker[call_key] >= 3:
+                            if not repeated_failure_intervened:
+                                # First time reaching 3: inject intervention message
+                                repeated_failure_intervened = True
+                                logger.warning(
+                                    "[Iter %d] Repeated failure detected for '%s' (3x). Injecting intervention.",
+                                    current_iteration,
+                                    tool_call.tool_name
+                                )
+                                self.messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        f"CRITICAL: The action '{tool_call.tool_name}' with arguments {tool_call.arguments} "
+                                        f"has failed 3 times with error: '{err_str}'. "
+                                        "Do NOT repeat this identical action. Try an alternative approach or different parameters."
+                                    )
+                                })
+                            else:
+                                # Still failing after intervention: terminate loop
+                                logger.error(
+                                    "[Iter %d] Action '%s' repeated failure threshold exceeded. Halting.",
+                                    current_iteration,
+                                    tool_call.tool_name
+                                )
+                                abort_for_repeated_failure = True
 
                     # Maintain execution-specific history and correction counter
                     if tool_call.tool_name == "execute_python":
@@ -324,14 +521,26 @@ class CodeMateAgent:
                         if not record.success:
                             correction_attempts += 1
 
+                    # Stage 2: Truncate large tool outputs before feeding back to LLM context
+                    sanitized_result = truncate_tool_output(record.result, self.config.max_tool_output_chars)
+
                     # Provide tool output back to LLM context
                     tool_response_msg: Dict[str, Any] = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.tool_name,
-                        "content": json.dumps(record.result)
+                        "content": json.dumps(sanitized_result)
                     }
                     self.messages.append(tool_response_msg)
+
+                if abort_for_repeated_failure:
+                    success = False
+                    termination_reason = "repeated_failure"
+                    final_response_text = (
+                        f"Agent halted: Repeated failure threshold exceeded for tool call '{tool_call.tool_name}'. "
+                        "Same action failed 3+ times without progress."
+                    )
+                    break
 
                 # Continue to next iteration so LLM can inspect tool output
                 continue
@@ -390,6 +599,7 @@ class CodeMateAgent:
             total_prompt_tokens=total_prompt_tokens,
             total_completion_tokens=total_completion_tokens,
             total_tokens=total_tokens,
+            plan=self.state.get_plan() if self.state else [],
             execution_history=execution_history,
             action_history=action_history,
             messages=self.messages
