@@ -15,6 +15,7 @@ Key Responsibilities:
 """
 
 import inspect
+import typing
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -84,7 +85,7 @@ class ToolRegistry:
 
     def get_groq_schemas(self) -> List[Dict[str, Any]]:
         """
-        Generate standard JSON function-calling schemas compatible with Groq / Llama 3 models.
+        Generate standard JSON function-calling schemas compatible with Groq models.
         """
         schemas: List[Dict[str, Any]] = []
         for name, tool_def in self._tools.items():
@@ -95,18 +96,33 @@ class ToolRegistry:
                 if param_name in {"config"}:
                     continue
 
-                param_type = "string"
-                if param.annotation == int:
-                    param_type = "integer"
-                elif param.annotation == bool:
-                    param_type = "boolean"
-                elif param.annotation == float:
-                    param_type = "number"
+                ann = param.annotation
+                origin = typing.get_origin(ann)
 
-                properties[param_name] = {
-                    "type": param_type,
-                    "description": f"Parameter: {param_name}"
-                }
+                if ann == int:
+                    prop = {"type": "integer", "description": f"Parameter: {param_name}"}
+                elif ann == bool:
+                    prop = {"type": "boolean", "description": f"Parameter: {param_name}"}
+                elif ann == float:
+                    prop = {"type": "number", "description": f"Parameter: {param_name}"}
+                elif ann == list or origin in (list, typing.List, typing.Sequence):
+                    args = typing.get_args(ann)
+                    item_type = "string"
+                    if args and args[0] == int:
+                        item_type = "integer"
+                    elif args and args[0] == bool:
+                        item_type = "boolean"
+                    elif args and args[0] == float:
+                        item_type = "number"
+                    prop = {
+                        "type": "array",
+                        "items": {"type": item_type},
+                        "description": f"Parameter: {param_name}"
+                    }
+                else:
+                    prop = {"type": "string", "description": f"Parameter: {param_name}"}
+
+                properties[param_name] = prop
                 if param.default is inspect.Parameter.empty:
                     required.append(param_name)
 

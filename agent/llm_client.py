@@ -2,21 +2,22 @@
 CodeMate AI - Groq LLM Gateway Client (agent/llm_client.py)
 ===========================================================
 
-Production-grade client for Groq API using Llama 3 models with function/tool calling.
+Production-grade client for Groq API using tool-calling models (defaults to DEFAULT_MODEL).
 Supports multi-turn conversation history, robust error and rate limit handling,
 structured tool-call schema formatting, and secure credential handling.
 
 Key Features:
 - Secure: Never logs or exposes GROQ_API_KEY.
-- Resilient: Explicitly handles AuthenticationError, RateLimitError, APIConnectionError.
+- Resilient: Explicitly handles AuthenticationError, RateLimitError, APIConnectionError, model_not_found.
 - Observable: Structured logging for token usage, latency, and tool calls.
-- Flexible: Configurable model (defaults to llama-3.3-70b-versatile).
+- Flexible: Configurable model (defaults to DEFAULT_MODEL).
 """
 
 import inspect
 import json
 import logging
 import time
+import typing
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -31,7 +32,7 @@ from groq import (
     RateLimitError,
 )
 
-from config import Config, ConfigurationError, load_config
+from config import Config, ConfigurationError, load_config, DEFAULT_MODEL
 from tools.tool_registry import ToolRegistry
 
 # Configure module-level logger
@@ -123,7 +124,7 @@ class GroqClient:
 
     def format_tool_schema(self, tool_registry: ToolRegistry) -> List[Dict[str, Any]]:
         """
-        Convert registered tools into standard JSON schemas for Groq / Llama 3 tool-calling.
+        Convert registered tools into standard JSON schemas for Groq tool-calling.
         """
         schemas: List[Dict[str, Any]] = []
         for tool_info in tool_registry.list_tools():
@@ -138,16 +139,33 @@ class GroqClient:
                 if param_name in {"config"}:
                     continue
 
-                param_type = "string"
-                if param.annotation == int:
-                    param_type = "integer"
-                elif param.annotation == bool:
-                    param_type = "boolean"
+                ann = param.annotation
+                origin = typing.get_origin(ann)
 
-                properties[param_name] = {
-                    "type": param_type,
-                    "description": f"Parameter: {param_name}"
-                }
+                if ann == int:
+                    prop = {"type": "integer", "description": f"Parameter: {param_name}"}
+                elif ann == bool:
+                    prop = {"type": "boolean", "description": f"Parameter: {param_name}"}
+                elif ann == float:
+                    prop = {"type": "number", "description": f"Parameter: {param_name}"}
+                elif ann == list or origin in (list, typing.List, typing.Sequence):
+                    args = typing.get_args(ann)
+                    item_type = "string"
+                    if args and args[0] == int:
+                        item_type = "integer"
+                    elif args and args[0] == bool:
+                        item_type = "boolean"
+                    elif args and args[0] == float:
+                        item_type = "number"
+                    prop = {
+                        "type": "array",
+                        "items": {"type": item_type},
+                        "description": f"Parameter: {param_name}"
+                    }
+                else:
+                    prop = {"type": "string", "description": f"Parameter: {param_name}"}
+
+                properties[param_name] = prop
                 if param.default is inspect.Parameter.empty:
                     required.append(param_name)
 
@@ -235,6 +253,20 @@ class GroqClient:
                         "Failed to connect to Groq API after 3 retries. Check your internet connection."
                     ) from exc
             except (BadRequestError, APIStatusError, GroqError) as exc:
+                err_str = str(exc)
+                if getattr(exc, "status_code", None) == 404 or "model_not_found" in err_str:
+                    available = []
+                    try:
+                        available = [
+                            m.id for m in client.models.list().data
+                            if not any(x in m.id for x in ["whisper", "guard", "orpheus"])
+                        ]
+                    except Exception:
+                        pass
+                    avail_str = ", ".join(available) if available else "none found"
+                    msg = f"Model '{self.model_name}' is not available for your Groq key. Available: {avail_str}"
+                    logger.error(msg)
+                    raise LLMClientError(msg) from exc
                 logger.error("Groq API Error: %s", exc)
                 raise LLMClientError(f"Groq API error occurred: {exc}") from exc
 
