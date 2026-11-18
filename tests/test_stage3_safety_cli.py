@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 
-from config import Config
+from config import Config, DEFAULT_MODEL
 from agent.agent import CodeMateAgent
 from cli import CLIApprovalAgent
 from tools.tool_registry import create_default_registry
@@ -22,7 +22,7 @@ def stage3_config(tmp_path):
     ws.mkdir(parents=True, exist_ok=True)
     return Config(
         groq_api_key="mock_key",
-        model_name="llama-3.3-70b-versatile",
+        model_name=DEFAULT_MODEL,
         max_iterations=5,
         execution_timeout_seconds=5,
         require_user_approval=True,

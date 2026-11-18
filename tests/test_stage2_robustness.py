@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from groq import RateLimitError, APIConnectionError
 
-from config import Config
+from config import Config, DEFAULT_MODEL
 from agent.agent import CodeMateAgent, AgentResult, truncate_tool_output, compress_conversation_history
 from agent.llm_client import GroqClient, LLMResponse, ToolCallRequest, LLMRateLimitError, LLMConnectionError
 from tools.tool_registry import ToolRegistry
@@ -23,7 +23,7 @@ def stage2_config(tmp_path):
     ws.mkdir(parents=True, exist_ok=True)
     return Config(
         groq_api_key="mock_key",
-        model_name="llama-3.3-70b-versatile",
+        model_name=DEFAULT_MODEL,
         max_iterations=10,
         execution_timeout_seconds=5,
         require_user_approval=True,
@@ -122,7 +122,7 @@ class TestLLMClientRetryAndMalformedJSON:
         mock_resp.choices[0].message.tool_calls = None
         mock_resp.choices[0].finish_reason = "stop"
         mock_resp.usage = None
-        mock_resp.model = "llama-3.3-70b-versatile"
+        mock_resp.model = DEFAULT_MODEL
 
         rate_err = RateLimitError(message="Rate limit", response=MagicMock(status_code=429), body=None)
         mock_raw_client.chat.completions.create.side_effect = [rate_err, rate_err, mock_resp]
@@ -147,7 +147,7 @@ class TestLLMClientRetryAndMalformedJSON:
         mock_resp.choices[0].message.tool_calls = [mock_tc]
         mock_resp.choices[0].finish_reason = "tool_calls"
         mock_resp.usage = None
-        mock_resp.model = "llama-3.3-70b-versatile"
+        mock_resp.model = DEFAULT_MODEL
 
         mock_raw_client.chat.completions.create.return_value = mock_resp
         client._client = mock_raw_client

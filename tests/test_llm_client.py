@@ -8,10 +8,11 @@ import json
 from unittest.mock import MagicMock, patch
 import pytest
 
-from config import Config
+from config import Config, DEFAULT_MODEL
 from agent.llm_client import (
     GroqClient,
     LLMAuthenticationError,
+    LLMClientError,
     LLMConnectionError,
     LLMRateLimitError,
     LLMResponse,
@@ -25,7 +26,7 @@ def mock_config(tmp_path):
     """Provides a test config with a fake API key and workspace."""
     return Config(
         groq_api_key="gsk_mock_valid_key_12345",
-        model_name="llama-3.3-70b-versatile",
+        model_name=DEFAULT_MODEL,
         max_iterations=5,
         execution_timeout_seconds=5,
         require_user_approval=True,
@@ -42,7 +43,7 @@ class TestGroqClientMocked:
     def test_missing_api_key_raises_auth_error(self, tmp_path):
         bad_config = Config(
             groq_api_key="",
-            model_name="llama-3.3-70b-versatile",
+            model_name=DEFAULT_MODEL,
             max_iterations=5,
             execution_timeout_seconds=5,
             require_user_approval=True,
@@ -75,7 +76,7 @@ class TestGroqClientMocked:
         mock_completion = MagicMock()
         mock_completion.choices = [mock_choice]
         mock_completion.usage = mock_usage
-        mock_completion.model = "llama-3.3-70b-versatile"
+        mock_completion.model = DEFAULT_MODEL
 
         mock_instance.chat.completions.create.return_value = mock_completion
 
@@ -113,7 +114,7 @@ class TestGroqClientMocked:
         mock_completion = MagicMock()
         mock_completion.choices = [mock_choice]
         mock_completion.usage = MagicMock(prompt_tokens=30, completion_tokens=20, total_tokens=50)
-        mock_completion.model = "llama-3.3-70b-versatile"
+        mock_completion.model = DEFAULT_MODEL
 
         mock_instance.chat.completions.create.return_value = mock_completion
 
@@ -177,10 +178,35 @@ class TestGroqClientMocked:
         mock_completion = MagicMock()
         mock_completion.choices = [mock_choice]
         mock_completion.usage = MagicMock(prompt_tokens=5, completion_tokens=3, total_tokens=8)
-        mock_completion.model = "llama-3.3-70b-versatile"
+        mock_completion.model = DEFAULT_MODEL
 
         mock_instance.chat.completions.create.return_value = mock_completion
 
         client = GroqClient(config=mock_config)
         answer = client.ask("What is 2+2?", system_prompt="You are a math tutor.")
         assert answer == "Quick answer."
+
+    @patch("agent.llm_client.Groq")
+    def test_model_not_found_graceful_handling(self, mock_groq_class, mock_config):
+        mock_instance = MagicMock()
+        mock_groq_class.return_value = mock_instance
+
+        # Mock models.list()
+        mock_model_item = MagicMock()
+        mock_model_item.id = "openai/gpt-oss-120b"
+        mock_instance.models.list.return_value = MagicMock(data=[mock_model_item])
+
+        # Mock 404 model_not_found error
+        mock_res = MagicMock(status_code=404)
+        mock_instance.chat.completions.create.side_effect = groq.APIStatusError(
+            message="Error code: 404 - {'code': 'model_not_found'}",
+            response=mock_res,
+            body={"error": {"code": "model_not_found"}}
+        )
+
+        client = GroqClient(config=mock_config)
+        with pytest.raises(LLMClientError) as exc:
+            client.chat(messages=[{"role": "user", "content": "hi"}])
+
+        assert "is not available for your Groq key" in str(exc.value)
+        assert "Available:" in str(exc.value)

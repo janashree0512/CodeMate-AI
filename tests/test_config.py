@@ -15,6 +15,8 @@ from config import (
     parse_bool,
     parse_positive_int,
     PROJECT_ROOT,
+    DEFAULT_MODEL,
+    SUPPORTED_MODELS,
 )
 
 
@@ -83,7 +85,7 @@ class TestConfigLoading:
 
         config = load_config(strict_api_key=False)
 
-        assert config.model_name == "llama-3.3-70b-versatile"
+        assert config.model_name == DEFAULT_MODEL
         assert config.max_iterations == 10
         assert config.execution_timeout_seconds == 10
         assert config.require_user_approval is True
@@ -94,7 +96,7 @@ class TestConfigLoading:
     def test_custom_environment_overrides(self, monkeypatch, tmp_path):
         custom_workspace = tmp_path / "custom_sandbox"
         monkeypatch.setenv("GROQ_API_KEY", "gsk_test_key_123456789")
-        monkeypatch.setenv("MODEL_NAME", "llama-3.1-70b-versatile")
+        monkeypatch.setenv("MODEL_NAME", "custom-override-model")
         monkeypatch.setenv("MAX_ITERATIONS", "15")
         monkeypatch.setenv("EXECUTION_TIMEOUT_SECONDS", "25")
         monkeypatch.setenv("REQUIRE_USER_APPROVAL", "false")
@@ -103,7 +105,7 @@ class TestConfigLoading:
         config = load_config(strict_api_key=False)
 
         assert config.groq_api_key == "gsk_test_key_123456789"
-        assert config.model_name == "llama-3.1-70b-versatile"
+        assert config.model_name == "custom-override-model"
         assert config.max_iterations == 15
         assert config.execution_timeout_seconds == 25
         assert config.require_user_approval is False
@@ -136,3 +138,46 @@ class TestConfigLoading:
 
         assert config.workspace_dir == nested_dir.resolve()
         assert config.workspace_dir.exists()
+
+
+class TestModelNameConsistency:
+    """Verifies that the LLM model name is unified across the codebase."""
+
+    def test_default_model_constant_and_values(self):
+        assert DEFAULT_MODEL == "openai/gpt-oss-120b"
+        assert DEFAULT_MODEL in SUPPORTED_MODELS
+        assert "openai/gpt-oss-20b" in SUPPORTED_MODELS
+        assert "qwen/qwen3.8-27b" in SUPPORTED_MODELS
+
+    def test_default_config_model_matches_constant(self, monkeypatch):
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+        cfg = load_config(strict_api_key=False)
+        assert cfg.model_name == DEFAULT_MODEL
+
+    def test_no_hardcoded_model_names_in_source_files(self):
+        """Fails if any Python source file other than config.py hardcodes a model string in executable code."""
+        source_roots = [
+            PROJECT_ROOT / "app.py",
+            PROJECT_ROOT / "cli.py",
+            PROJECT_ROOT / "ui",
+            PROJECT_ROOT / "agent",
+            PROJECT_ROOT / "tools",
+        ]
+        hardcoded_violations = []
+        forbidden_substrings = [DEFAULT_MODEL, "llama-3.3-70b-versatile", "llama3-70b-8192"]
+
+        for entry in source_roots:
+            files = [entry] if entry.is_file() else list(entry.glob("**/*.py"))
+            for py_file in files:
+                if py_file.name == "config.py":
+                    continue
+                content = py_file.read_text(encoding="utf-8")
+                for idx, line in enumerate(content.splitlines(), 1):
+                    stripped = line.strip()
+                    if stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'''"):
+                        continue
+                    for forbidden in forbidden_substrings:
+                        if f'"{forbidden}"' in line or f"'{forbidden}'" in line:
+                            hardcoded_violations.append(f"{py_file.name}:{idx} -> {line.strip()}")
+
+        assert not hardcoded_violations, f"Found hardcoded model names in source files:\n" + "\n".join(hardcoded_violations)

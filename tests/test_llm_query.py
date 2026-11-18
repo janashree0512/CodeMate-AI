@@ -13,7 +13,7 @@ Usage:
 import sys
 import time
 from unittest.mock import MagicMock
-from config import load_config, ConfigurationError
+from config import load_config, ConfigurationError, DEFAULT_MODEL
 from agent.llm_client import GroqClient, LLMAuthenticationError, LLMClientError, LLMResponse
 
 
@@ -38,7 +38,7 @@ def run_live_test(client: GroqClient, question: str, system_prompt: str):
 def run_mock_test(question: str):
     """Run simulated test to demonstrate behavior offline."""
     print("--------------------------------------------------")
-    print("Model Response (Simulated llama-3.3-70b-versatile):")
+    print(f"Model Response (Simulated {DEFAULT_MODEL}):")
     print("--------------------------------------------------")
     mock_reply = (
         "def is_palindrome(text: str) -> bool:\n"

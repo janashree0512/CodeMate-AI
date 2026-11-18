@@ -5,7 +5,7 @@ and structured error reporting for unknown tools or bad arguments.
 """
 
 import pytest
-from config import Config
+from config import Config, DEFAULT_MODEL
 from tools.tool_registry import ToolRegistry, create_default_registry
 
 
@@ -16,7 +16,7 @@ def test_config(tmp_path):
     workspace.mkdir(parents=True, exist_ok=True)
     return Config(
         groq_api_key="mock_key",
-        model_name="llama-3.3-70b-versatile",
+        model_name=DEFAULT_MODEL,
         max_iterations=10,
         execution_timeout_seconds=5,
         require_user_approval=True,

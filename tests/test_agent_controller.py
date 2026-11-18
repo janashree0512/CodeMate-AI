@@ -7,7 +7,7 @@ and maximum iteration limits using a controlled mock LLM client with real tool e
 from unittest.mock import MagicMock
 import pytest
 
-from config import Config
+from config import Config, DEFAULT_MODEL
 from agent.agent import CodeMateAgent, run_agent, AgentResult
 from agent.llm_client import LLMResponse, ToolCallRequest
 from tools.tool_registry import create_default_registry
@@ -20,7 +20,7 @@ def agent_config(tmp_path):
     workspace.mkdir(parents=True, exist_ok=True)
     return Config(
         groq_api_key="gsk_mock_valid_key",
-        model_name="llama-3.3-70b-versatile",
+        model_name=DEFAULT_MODEL,
         max_iterations=4,
         execution_timeout_seconds=5,
         require_user_approval=True,
@@ -41,7 +41,7 @@ class TestAgentController:
             content="Direct explanation without needing any tools.",
             tool_calls=[],
             finish_reason="stop",
-            model="llama-3.3-70b-versatile",
+            model=DEFAULT_MODEL,
             prompt_tokens=10,
             completion_tokens=8,
             total_tokens=18
@@ -73,7 +73,7 @@ class TestAgentController:
                 )
             ],
             finish_reason="tool_calls",
-            model="llama-3.3-70b-versatile"
+            model=DEFAULT_MODEL
         )
 
         # Turn 2: LLM receives tool result and concludes
@@ -81,7 +81,7 @@ class TestAgentController:
             content="Successfully created greet.py with greeting message.",
             tool_calls=[],
             finish_reason="stop",
-            model="llama-3.3-70b-versatile"
+            model=DEFAULT_MODEL
         )
 
         mock_llm.chat.side_effect = [turn_1_response, turn_2_response]

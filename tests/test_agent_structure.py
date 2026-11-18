@@ -31,7 +31,7 @@ def test_tools_package_imports():
 def test_llm_client_tool_schema_generation(tmp_path):
     test_cfg = config.Config(
         groq_api_key="mock",
-        model_name="llama-3.3-70b-versatile",
+        model_name=config.DEFAULT_MODEL,
         max_iterations=5,
         execution_timeout_seconds=5,
         require_user_approval=True,
@@ -53,7 +53,7 @@ def test_llm_client_tool_schema_generation(tmp_path):
 def test_agent_controller_initialization(tmp_path):
     test_cfg = config.Config(
         groq_api_key="mock",
-        model_name="llama-3.3-70b-versatile",
+        model_name=config.DEFAULT_MODEL,
         max_iterations=3,
         execution_timeout_seconds=5,
         require_user_approval=True,
