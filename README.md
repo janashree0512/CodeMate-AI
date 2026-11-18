@@ -12,7 +12,7 @@ Traditional LLMs operate in an open-loop, stateless manner: they generate code s
 ### The Solution: CodeMate AI
 CodeMate AI implements an explicit, transparent ReAct control loop:
 1. **Autonomous Planning**: Deconstructs user tasks into discrete, verifiable actions with `update_plan` and `show_plan`.
-2. **First-Principles Tool Calling**: Direct integration with Groq API and Llama 3 models without heavy framework dependencies.
+2. **First-Principles Tool Calling**: Direct integration with Groq API and tool-calling models (default: openai/gpt-oss-120b) without heavy framework dependencies.
 3. **Sandboxed Workspace**: All file modifications are restricted to an isolated `workspace/` directory with path traversal guards.
 4. **Controlled Subprocess Execution**: Scripts and allowlisted shell commands run in a sanitized child environment with strict execution timeouts and separate stdout/stderr capture.
 5. **Self-Correction Loop**: Execution failures produce structured diagnostic reports that the agent uses to patch code and re-verify until success or iteration limits are reached.
@@ -37,7 +37,7 @@ CodeMate AI implements an explicit, transparent ReAct control loop:
                    v                                   v
 +--------------------------------------+   +------------------------------+
 |             LLM Gateway              |   |        Tool Registry         |
-|   (Groq Llama 3.3 | Auto-Retry)      |   |   (Dispatcher & Schemas)     |
+|   (Groq API | Auto-Retry)            |   |   (Dispatcher & Schemas)     |
 +--------------------------------------+   +--------------+---------------+
                                                           |
                  +----------------------------------------+----------------------------------------+
@@ -158,8 +158,8 @@ CodeMate_AI/
 
 ### 1. Clone the Repository & Create Virtual Environment
 ```bash
-git clone https://github.com/[YOUR-USERNAME-OR-ORGANIZATION]/CodeMate_AI.git
-cd CodeMate_AI
+git clone https://github.com/janashree0512/CodeMate-AI.git
+cd CodeMate-AI
 python -m venv venv
 
 # Windows:
@@ -174,7 +174,8 @@ pip install -r requirements.txt
 ```
 
 ### 3. Configure Environment Variables
-Copy `.env.example` to `.env` and set your Groq API key:
+1. Obtain a free Groq API key from [Groq Console](https://console.groq.com/keys).
+2. Copy `.env.example` to `.env` and set your key:
 ```bash
 # Windows:
 copy .env.example .env
@@ -184,7 +185,7 @@ cp .env.example .env
 Edit `.env`:
 ```env
 GROQ_API_KEY=gsk_your_actual_key_here
-MODEL_NAME=llama-3.3-70b-versatile
+MODEL_NAME=openai/gpt-oss-120b
 MAX_ITERATIONS=10
 EXECUTION_TIMEOUT_SECONDS=10
 REQUIRE_USER_APPROVAL=true
@@ -217,3 +218,21 @@ Use `/help`, `/files`, `/clear`, or type any task directly.
 python demo_live_selfcorrection.py
 ```
 Demonstrates autonomous multi-turn bug diagnosis and patching on the live Groq API.
+
+---
+
+## 7. Known Limitations & Security Model
+
+CodeMate AI implements defense-in-depth isolation for local development:
+- **Subprocess Isolation**: Commands and scripts run in isolated subprocesses (`shell=False`, `cwd=workspace/`) with stripped environment variables (`GROQ_API_KEY`, tokens, and credentials removed).
+- **Workspace Jailing**: Path resolution ensures all file reads, writes, edits, and shell arguments remain confined strictly to `workspace/`.
+- **Static AST Analysis**: Python scripts undergo static AST scans rejecting imports of dangerous modules (`subprocess`, `socket`, `shutil`, `ctypes`), process execution calls (`os.system`, `os.popen`), dynamic code evaluation (`eval`, `exec`), and path traversal in `open()`.
+- **Command Allowlists**: Shell commands are restricted to `python` (scripts in workspace or `-m pytest`), `pytest` (safe flags), `pip install` (clean package names only), and cross-platform sandboxed `ls` / `cat`.
+
+### Limitations of Local Subprocess Sandboxing
+While application-level restrictions and AST checks effectively mitigate common escape and injection vectors:
+1. **OS Kernel Sharing**: Subprocesses share the host OS kernel and filesystem namespace. Highly determined or novel C-extension / memory exploits cannot be guaranteed blocked solely at the Python runtime level.
+2. **Production Recommendations**: For untrusted multi-tenant or enterprise environments, local subprocess execution should be complemented or replaced with:
+   - **Containerization**: Ephemeral Docker or Podman containers per execution session with read-only root filesystems and dropped capabilities (`--cap-drop=ALL`).
+   - **MicroVMs**: Hardware-isolated lightweight microVMs (e.g., AWS Firecracker, gVisor, or Fly Machines) offering dedicated kernel boundaries.
+   - **Network Namespaces**: Hard network isolation (`--network none`) preventing all outbound network access.

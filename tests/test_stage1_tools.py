@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 import pytest
 
-from config import Config
+from config import Config, DEFAULT_MODEL
 from tools.file_tools import (
     create_file,
     read_file,
@@ -31,7 +31,7 @@ def stage1_config(tmp_path):
     ws.mkdir(parents=True, exist_ok=True)
     return Config(
         groq_api_key="mock_key",
-        model_name="llama-3.3-70b-versatile",
+        model_name=DEFAULT_MODEL,
         max_iterations=10,
         execution_timeout_seconds=5,
         require_user_approval=True,
@@ -128,13 +128,15 @@ class TestRunShellTool:
     """Tests for run_shell: allowlist, dangerous token blocking, timeout, and approval."""
 
     def test_run_shell_success(self, stage1_config):
-        res = run_shell("python -c \"print('Hello from shell')\"", approved=True, config=stage1_config)
+        create_file("hello.py", "print('Hello from shell')", config=stage1_config)
+        res = run_shell("python hello.py", approved=True, config=stage1_config)
         assert res["success"] is True
         assert res["exit_code"] == 0
         assert "Hello from shell" in res["stdout"]
 
     def test_run_shell_requires_approval(self, stage1_config):
-        res = run_shell("python -c \"print(1)\"", approved=False, config=stage1_config)
+        create_file("hello.py", "print('Hello from shell')", config=stage1_config)
+        res = run_shell("python hello.py", approved=False, config=stage1_config)
         assert res["success"] is False
         assert res["approval_required"] is True
         assert "requires explicit user approval" in res["error"]
