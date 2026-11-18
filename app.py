@@ -65,6 +65,8 @@ def run_agent_workflow(
         max_iterations=runtime_settings.get("max_iterations", config.max_iterations),
         execution_timeout_seconds=runtime_settings.get("timeout", config.execution_timeout_seconds),
         require_user_approval=runtime_settings.get("require_approval", config.require_user_approval),
+        max_tool_output_chars=config.max_tool_output_chars,
+        max_history_messages=config.max_history_messages,
         workspace_dir=config.workspace_dir,
         project_root=config.project_root
     )
@@ -115,15 +117,21 @@ def run_agent_workflow(
             ),
             tool_calls=[]
         )
-        mock_llm.chat.side_effect = [resp_1, resp_2, resp_3]
+        final_resp = LLMResponse(
+            content="✅ All steps completed. No further tool calls needed.",
+            tool_calls=[]
+        )
+        mock_llm.chat.side_effect = [resp_1, resp_2, resp_3, final_resp]
+        # In demonstration (mock) mode, show a prominent banner explaining that approvals are bypassed
+        st.info("ℹ️ Demo mode: approvals disabled, mock LLM, not a real run")
         agent = CodeMateAgent(
             config=effective_config,
             registry=registry,
             llm_client=mock_llm,
-            auto_approve=not effective_config.require_user_approval
+            auto_approve=True
         )
     else:
-        # Live execution with Groq API
+        # Live execution with Groq API: strictly respect user's approval setting
         agent = CodeMateAgent(
             config=effective_config,
             registry=registry,
